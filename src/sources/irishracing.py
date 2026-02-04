@@ -3,16 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, Tuple
+from typing import Tuple
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-
-UA = "Mozilla/5.0 (compatible; HorseRacingSheetsBot/1.0; +https://github.com/)"
-
-RACECARDS_URL = "https://www.irishracing.com/racecards"
+UA = "Mozilla/5.0 (compatible; HorseRacingSheetsBot/1.0)"
 BASE = "https://www.irishracing.com"
 
 
@@ -34,12 +31,30 @@ def _frac_to_decimal(frac: str) -> float | None:
         return None
 
 
+def _today_label() -> str:
+    # Example: Wed-4th-Feb-2026
+    dt = datetime.now()
+    day = dt.day
+    suffix = "th"
+    if 10 <= day % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{dt.strftime('%a')}-{day}{suffix}-{dt.strftime('%b')}-{dt.strftime('%Y')}"
+
+
 @dataclass(frozen=True)
-class RaceRef:
-    date_label: str   # e.g. Wed-4th-Feb-2026
-    course: str       # e.g. Newcastle
-    race_id: str      # e.g. 1900
-    off_time: str     # e.g. 7.00
+class Race:
+    date: str
+    date_label: str
+    course: str
+    off_time: str
+    race_name: str
+    distance: str
+    going: str
+    class_band: str
+    race_url: str
+    race_key: str  # unique id we create: f"{course}_{off_time}_{race_name}"
 
 
 class IrishRacingClient:
@@ -50,144 +65,196 @@ class IrishRacingClient:
         self.session.headers.update({"User-Agent": UA})
 
     def fetch_today(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Returns (races_df, runners_df)."""
-        html = self.session.get(RACECARDS_URL, timeout=self.timeout).text
+        """
+        Pull TODAY by date label page:
+          /racecards/<DATE_LABEL>
+        Then for each meeting:
+          /racecards/<DATE_LABEL>/<COURSE>
+        We parse runners + "Probable SP" from the course page.
+        """
+        date_label = _today_label()
+        day_url = f"{BASE}/racecards/{date_label}"
+
+        html = self.session.get(day_url, timeout=self.timeout).text
         soup = BeautifulSoup(html, "lxml")
 
-        # The racecards page contains many meetings; we only keep GB/IRE if requested.
-        # We find meeting headers by looking for course names then collect following race links.
-        links = soup.select("a[href*='/racecards/']")
-        # These are individual race links like /racecards/Wed-4th-Feb-2026/Newcastle/1900
-        race_hrefs = []
-        for a in links:
+        meeting_links = []
+        for a in soup.select("a[href^='/racecards/']"):
             href = a.get("href", "")
-            if re.search(r"^/racecards/[^/]+/[^/]+/\d+$", href):
-                race_hrefs.append(href)
+            # meeting page pattern: /racecards/<date>/<course>
+            if re.fullmatch(rf"/racecards/{re.escape(date_label)}/[^/]+", href):
+                meeting_links.append(href)
 
-        race_hrefs = list(dict.fromkeys(race_hrefs))  # unique preserve order
+        meeting_links = list(dict.fromkeys(meeting_links))
 
-        races: list[dict] = []
-        runners: list[pd.DataFrame] = []
+        races_all = []
+        runners_all = []
 
-        for href in race_hrefs:
-            try:
-                rr = self._parse_race_ref(href)
-            except Exception:
-                continue
-
-            # region filter is best-effort (site doesn't label region in the link)
-            if self.region in ("gb", "ire"):
-                # crude heuristic: Irish courses often include (IRE) in runners, but too late.
-                # So we keep all here; region filter will be applied later on runners if needed.
-                pass
-
-            race_url = BASE + href
-            race_df, runners_df = self._fetch_racecard(race_url, rr)
-            if not race_df.empty:
-                races.append(race_df.iloc[0].to_dict())
+        for href in meeting_links:
+            course_url = BASE + href
+            course = href.split("/")[-1]
+            races_df, runners_df = self._parse_course_all_races(course_url, date_label, course)
+            if not races_df.empty:
+                races_all.append(races_df)
             if not runners_df.empty:
-                runners.append(runners_df)
+                runners_all.append(runners_df)
 
-        races_df = pd.DataFrame(races)
-        runners_df = pd.concat(runners, ignore_index=True) if runners else pd.DataFrame()
+        races = pd.concat(races_all, ignore_index=True) if races_all else pd.DataFrame()
+        runners = pd.concat(runners_all, ignore_index=True) if runners_all else pd.DataFrame()
 
-        # standardize date column
-        if "date" in races_df.columns:
-            races_df["date"] = pd.to_datetime(races_df["date"]).dt.date.astype(str)
-        if "date" in runners_df.columns:
-            runners_df["date"] = pd.to_datetime(runners_df["date"]).dt.date.astype(str)
-
-        return races_df, runners_df
+        return races, runners
 
     def enrich_with_best_prices(self, runners_df: pd.DataFrame) -> pd.DataFrame:
-        """Adds best_price_frac and best_price_dec per runner using odds comparison pages."""
-        if runners_df.empty:
-            return runners_df
-
+        # Already populated from Probable SP on racecards
         df = runners_df.copy()
-        best_frac = []
-        best_dec = []
-
-        for _, r in df.iterrows():
-            date_label = r["date_label"]
-            course = r["course"]
-            race_id = str(r["race_id"])
-            runner = r["runner"]
-
-            url = f"{BASE}/odds-comparison/{date_label}/{course}/{race_id}"
-            frac = self._best_price_for_runner(url, runner)
-            dec = _frac_to_decimal(frac) if frac else None
-            best_frac.append(frac or "")
-            best_dec.append(dec or "")
-
-        df["best_price_frac"] = best_frac
-        df["best_price_dec"] = best_dec
-
-        # drop runners where no odds found (usually non-runners / missing market)
-        df = df[df["best_price_dec"] != ""].copy()
-        df["best_price_dec"] = df["best_price_dec"].astype(float)
+        df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
+        df = df.dropna(subset=["best_price_dec"]).copy()
         return df
 
-    # -----------------------
-    # Internals
-    # -----------------------
-    def _parse_race_ref(self, href: str) -> RaceRef:
-        # /racecards/Wed-4th-Feb-2026/Newcastle/1900
-        parts = href.strip("/").split("/")
-        return RaceRef(date_label=parts[1], course=parts[2], race_id=parts[3], off_time="")
-
-    def _fetch_racecard(self, url: str, rr: RaceRef) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # -------------------------
+    # Internal parsing
+    # -------------------------
+    def _parse_course_all_races(self, url: str, date_label: str, course: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         html = self.session.get(url, timeout=self.timeout).text
         soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True)
 
-        # meta headline block
-        title = _clean(soup.select_one("h1").get_text(" ", strip=True)) if soup.select_one("h1") else ""
-        # off time appears in breadcrumbs and in the race nav; we'll pull the first time-like token
-        text = soup.get_text(" ", strip=True)
-        m_time = re.search(r"\b(\d{1,2}\.\d{2})\b", text)
-        off_time = m_time.group(1) if m_time else ""
-
+        # Going appears as "Going - <text>."
         going = ""
-        m_going = re.search(r"Going\s*-\s*([A-Za-z/\s\(\)]+?)\.", text)
+        m_going = re.search(r"Going\s*-\s*(.+?)\.", text)
         if m_going:
             going = _clean(m_going.group(1))
 
-        # distance like '5f.' or '1m 5yds'
-        distance = ""
-        m_dist = re.search(r"(\d+m\s*\d+f\s*\d+yds|\d+m\s*\d+f|\d+m|\d+f\s*\d+yds|\d+f)\.", text)
-        if m_dist:
-            distance = _clean(m_dist.group(1))
+        date_iso = self._label_to_date(date_label)
 
-        class_band = ""
-        m_class = re.search(r"\(Class\s*(\d+)\)", text)
-        if m_class:
-            class_band = f"Class {m_class.group(1)}"
+        # Split by race time markers like "5.00", "12.28" etc.
+        # We keep blocks that contain "Probable SP -"
+        blocks = re.split(r"\n(?=\d{1,2}\.\d{2}\n)", text)
 
-        # date from the URL label
-        # 'Wed-4th-Feb-2026' -> 2026-02-04 best-effort
-        date = self._label_to_date(rr.date_label)
+        races_rows = []
+        runner_rows = []
 
-        race_row = {
-            "date": date,
-            "date_label": rr.date_label,
-            "course": rr.course,
-            "race_id": rr.race_id,
-            "off_time": off_time,
-            "race_name": title.replace("#", "").strip(),
-            "distance": distance,
-            "going": going,
-            "class_band": class_band,
-            "race_url": url,
-        }
+        for block in blocks:
+            m_time = re.match(r"(\d{1,2}\.\d{2})\n", block)
+            if not m_time:
+                continue
+            off_time = m_time.group(1)
 
-        runners = self._parse_runners(soup, race_row)
-        return pd.DataFrame([race_row]), runners
+            # Race name: often appears immediately after time as a line with words
+            # We take the first non-empty line after time that isn't "No" / "Form"
+            lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
+            if len(lines) < 3:
+                continue
+
+            race_name = ""
+            for ln in lines[1:8]:
+                if ln.lower() in ("no", "form", "horse age weight", "trainer", "jockey", "or"):
+                    continue
+                if re.match(r"^\d+\^\{", ln):
+                    continue
+                if re.search(r"Probable SP", ln):
+                    break
+                race_name = ln
+                break
+
+            # Distance often like "6f." or "2m. 3f. 17yds."
+            dist = ""
+            m_dist = re.search(r"(\d+m\.\s*\d+f\.\s*\d+yds\.|\d+m\.\s*\d+f\.|\d+f\.)", block)
+            if m_dist:
+                dist = _clean(m_dist.group(1)).replace(" .", ".")
+
+            class_band = ""
+            m_class = re.search(r"\(Class\s*(\d+)\)", block)
+            if m_class:
+                class_band = f"Class {m_class.group(1)}"
+
+            # Probable SP line
+            m_psp = re.search(r"Probable SP\s*-\s*(.+)", block)
+            if not m_psp:
+                # no market line -> skip (usually means page section not a proper race)
+                continue
+            psp = m_psp.group(1)
+
+            # Build a race key we can group on
+            race_key = f"{course}_{off_time}_{re.sub(r'[^A-Za-z0-9]+','_',race_name)[:40]}"
+
+            races_rows.append({
+                "date": date_iso,
+                "date_label": date_label,
+                "course": course,
+                "off_time": off_time,
+                "race_name": race_name,
+                "distance": dist,
+                "going": going,
+                "class_band": class_band,
+                "race_url": url,
+                "race_id": race_key,
+            })
+
+            # Parse Probable SP list: "7/4 Teardrops, 9/2 Laurens Dream, 5/1 Asadjumeirah, ..."
+            # We'll map horse -> frac odds.
+            horse_to_odds = {}
+            for part in psp.split(","):
+                part = part.strip()
+                m = re.match(r"(\d+/\d+)\s+(.+)$", part)
+                if not m:
+                    continue
+                frac = m.group(1).strip()
+                name = _clean(m.group(2))
+                # remove trailing "Others."
+                name = re.sub(r"\.\s*$", "", name)
+                horse_to_odds[name.lower()] = frac
+
+            # Runner names appear in the block as standalone lines with trainer/jockey/OR nearby.
+            # We'll take candidates that look like a name and exist in horse_to_odds (best effort).
+            for ln in lines:
+                # likely horse line contains letters and not too long
+                if len(ln) < 2 or len(ln) > 60:
+                    continue
+                if ln.lower().startswith("probable sp"):
+                    break
+                if re.search(r"\b(Probable|Image:|Midnite|Handicap|Maiden|Novice|H'cap|Stakes)\b", ln, re.IGNORECASE):
+                    continue
+
+                # if this line matches a horse in the odds list, keep it
+                key = ln.lower()
+                if key in horse_to_odds:
+                    frac = horse_to_odds[key]
+                    dec = _frac_to_decimal(frac)
+                    if not dec:
+                        continue
+                    runner_rows.append({
+                        "date": date_iso,
+                        "date_label": date_label,
+                        "course": course,
+                        "off_time": off_time,
+                        "race_name": race_name,
+                        "distance": dist,
+                        "going": going,
+                        "class_band": class_band,
+                        "race_id": race_key,
+                        "runner": ln,
+                        "best_price_frac": frac,
+                        "best_price_dec": float(dec),
+                        "rating": "",
+                        "days_since": 60,
+                        "course_distance": "",
+                        "trainer": "",
+                        "jockey": "",
+                        "weight": "",
+                        "age": "",
+                        "sex": "",
+                        "draw": "",
+                    })
+
+        races_df = pd.DataFrame(races_rows)
+        runners_df = pd.DataFrame(runner_rows).drop_duplicates(subset=["race_id", "runner"]) if runner_rows else pd.DataFrame()
+        return races_df, runners_df
 
     def _label_to_date(self, label: str) -> str:
         # label like Wed-4th-Feb-2026
         try:
             parts = label.split("-")
-            # parts: [Wed, 4th, Feb, 2026]
             day = re.sub(r"\D", "", parts[1])
             mon = parts[2]
             year = parts[3]
@@ -195,124 +262,3 @@ class IrishRacingClient:
             return dt.date().isoformat()
         except Exception:
             return datetime.utcnow().date().isoformat()
-
-    def _parse_runners(self, soup: BeautifulSoup, race_row: dict) -> pd.DataFrame:
-        """Best-effort runner parsing from racecard pages."""
-        # Runner names appear as links to /horse/ or /runner/ profiles; in the extracted HTML they look like:
-        # <a ...>Arnhem (IRE)</a> 10,b g 9-9 ...
-        runners = []
-        for a in soup.select("a[href^='/horse/'], a[href^='/runners/'], a[href^='/horse-racing/']"):
-            name = _clean(a.get_text(" ", strip=True))
-            # Filter out navigation items
-            if not name or len(name) < 2:
-                continue
-            if name.lower() in ("view all races", "view all cards", "view card"):
-                continue
-            # We only keep names that look like horses (often include (IRE)/(GB) but not required)
-            if re.search(r"\bhandicap\b|\bmaiden\b|\bnovice\b", name.lower()):
-                continue
-            # Deduplicate later
-            runners.append(name)
-
-        runners = list(dict.fromkeys(runners))
-
-        # Narrow: runner blocks usually have a pattern "Rated XX" near them.
-        page_text = soup.get_text("\n", strip=True)
-
-        rows = []
-        for runner in runners:
-            # find a chunk around the runner name
-            idx = page_text.find(runner)
-            if idx == -1:
-                continue
-            chunk = page_text[idx: idx + 800]
-
-            # rating
-            rating = None
-            m = re.search(r"Rated\s*(\d+)", chunk)
-            if m:
-                rating = int(m.group(1))
-
-            # weight pattern like 9-7 or 11-02
-            weight = ""
-            m = re.search(r"\b(\d{1,2}-\d{1,2})\b", chunk)
-            if m:
-                weight = m.group(1)
-
-            # age/sex pattern like '6,b g' or '10,b g'
-            age = ""
-            sex = ""
-            m = re.search(r"\b(\d{1,2})\s*,\s*([a-z])\s*([a-z])\b", chunk, re.IGNORECASE)
-            if m:
-                age = m.group(1)
-                sex = f"{m.group(2)} {m.group(3)}"
-
-            # trainer / jockey appear as separate links; best-effort: find first two after runner in HTML structure
-            trainer = ""
-            jockey = ""
-            # look for anchor tags following the runner anchor
-            runner_anchor = soup.find("a", string=re.compile(re.escape(runner)))
-            if runner_anchor:
-                # collect next few anchors text
-                next_as = []
-                for nxt in runner_anchor.find_all_next("a", limit=15):
-                    t = _clean(nxt.get_text(" ", strip=True))
-                    if t and t != runner and len(t) <= 40:
-                        next_as.append(t)
-                # heuristic: trainer + jockey are often consecutive and look like names with spaces
-                cand = [t for t in next_as if re.search(r"[A-Za-z]\s+[A-Za-z]", t)]
-                if len(cand) >= 2:
-                    trainer, jockey = cand[0], cand[1]
-
-            # course/distance marker: cd, c, d
-            course_distance = ""
-            m = re.search(r"\b(cd\^\{\d+\}|cd\b|c\b|d\b)", chunk, re.IGNORECASE)
-            if m:
-                course_distance = m.group(1).lower()
-
-            # days since last run
-            days_since = None
-            m = re.search(r"(\d{1,2})(st|nd|rd|th)\s+[A-Za-z]{3}\s+\d{2}", chunk)
-            if m:
-                # can't compute without full date reliably; keep blank
-                days_since = ""
-
-            row = {
-                **race_row,
-                "off_time": race_row.get("off_time", ""),
-                "runner": runner,
-                "rating": rating if rating is not None else "",
-                "weight": weight,
-                "age": age,
-                "sex": sex,
-                "trainer": trainer,
-                "jockey": jockey,
-                "course_distance": course_distance,
-                "days_since": days_since if days_since is not None else 60,  # default
-                "draw": "",
-            }
-            rows.append(row)
-
-        df = pd.DataFrame(rows)
-        # remove obvious non-runner duplicates / tiny lists
-        if not df.empty:
-            df = df.drop_duplicates(subset=["race_id", "runner"])
-        return df
-
-    def _best_price_for_runner(self, odds_url: str, runner_name: str) -> str | None:
-        """Extract a single (best-ish) fractional price for a runner from odds-comparison page."""
-        html = self.session.get(odds_url, timeout=self.timeout).text
-        soup = BeautifulSoup(html, "lxml")
-        text = soup.get_text("\n", strip=True)
-
-        # Find the runner section then the first fractional odds after it.
-        # Example patterns seen on the page:
-        # 'Monks Dream 5 7/2 Rating: 78 ...'
-        idx = text.lower().find(runner_name.lower())
-        if idx == -1:
-            return None
-        chunk = text[idx: idx + 400]
-        m = re.search(r"\b(\d+\s*/\s*\d+)\b", chunk)
-        if m:
-            return m.group(1).replace(" ", "")
-        return None
