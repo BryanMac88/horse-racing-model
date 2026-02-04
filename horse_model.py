@@ -12,6 +12,9 @@ from src.sheets import SheetsWriter
 
 TZ = ZoneInfo("Europe/Dublin")
 
+# ✅ Your chosen "night before" start time (Dublin time)
+NIGHT_BEFORE_HOUR = 22  # 22:00
+
 
 def env(name: str, default: str | None = None) -> str:
     v = os.getenv(name)
@@ -59,7 +62,6 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
     df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce", utc=True)
     df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
-
     df = df.dropna(subset=["snapshot_time", "best_price_dec", "race_id", "runner"]).copy()
 
     df["race_id"] = df["race_id"].astype(str).str.strip()
@@ -80,7 +82,6 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
             df["date"].astype(str) + " " + df["off_time_norm"].astype(str),
             errors="coerce",
         )
-        # localize only where parsed
         race_dt = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
         df["race_dt"] = race_dt
 
@@ -90,7 +91,7 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
     """
     Official movers:
-      - Start price = first snapshot AFTER 18:00 previous day (Dublin time)
+      - Start price = first snapshot AFTER 22:00 previous day (Dublin time)
       - Pre-race price = last snapshot at/before off_time - 30 minutes
     """
     if df is None or df.empty or "race_dt" not in df.columns:
@@ -101,7 +102,7 @@ def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     # Windows
-    d["night_start"] = (d["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=18)
+    d["night_start"] = (d["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=NIGHT_BEFORE_HOUR)
     d["cutoff_30m"] = d["race_dt"] - pd.Timedelta(minutes=30)
 
     key = ["race_id", "runner"]
@@ -246,6 +247,7 @@ def main() -> int:
         "races": int(len(races_df)),
         "runners": int(len(scored)),
         "value_bets": int(len(value_bets)),
+        "night_before_hour_local": NIGHT_BEFORE_HOUR,
     }]))
 
     # Snapshot rows for this run
