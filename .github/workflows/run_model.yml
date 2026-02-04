@@ -1,0 +1,31 @@
+name: Horse Racing Model
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run model + update sheet
+        env:
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+          SHEET_NAME: ${{ secrets.SHEET_NAME }}
+          REGION: ${{ secrets.REGION }}
+          MIN_VALUE_EDGE: ${{ secrets.MIN_VALUE_EDGE }}
+        run: |
+          echo "$GOOGLE_CREDS" > credentials.json
+          python horse_model.py
