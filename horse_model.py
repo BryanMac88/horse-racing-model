@@ -80,8 +80,8 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
 def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Immediate movers: uses the last TWO snapshots per runner.
-    Robust output columns: date/course/off_time/race_name always from the latest snapshot.
+    Immediate movers: last TWO snapshots per runner.
+    Robust against suffix/rename differences.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -104,41 +104,26 @@ def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
     prev = last_two[last_two["rn"] == 0].copy()
     curr = last_two[last_two["rn"] == 1].copy()
 
-    # Merge ONLY current race metadata from curr to avoid suffix chaos
-    curr_cols = key + ["best_price_dec", "snapshot_local"]
+    # Build a "current" table with consistent column names
+    curr_out = curr[key].copy()
+    curr_out["price_now"] = curr["best_price_dec"].values
+    curr_out["time_now"] = curr["snapshot_local"].values
     for c in ["date", "course", "off_time", "race_name"]:
-        if c in curr.columns:
-            curr_cols.append(c)
+        curr_out[c] = curr[c].values if c in curr.columns else ""
 
-    merged = prev[key + ["best_price_dec", "snapshot_local"]].merge(
-        curr[curr_cols],
-        on=key,
-        how="inner",
-        suffixes=("_prev", "_now"),
-    )
+    prev_out = prev[key].copy()
+    prev_out["price_prev"] = prev["best_price_dec"].values
+    prev_out["time_prev"] = prev["snapshot_local"].values
 
+    merged = prev_out.merge(curr_out, on=key, how="inner")
     if merged.empty:
         return pd.DataFrame()
-
-    merged = merged.rename(
-        columns={
-            "best_price_dec_prev": "price_prev",
-            "best_price_dec": "price_now",
-            "snapshot_local_prev": "time_prev",
-            "snapshot_local": "time_now",
-        }
-    )
 
     merged["pct_change"] = (merged["price_now"] - merged["price_prev"]) / merged["price_prev"]
     merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
 
     # filter noise
     merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
-
-    # Ensure readable columns exist (fill blanks if missing)
-    for c in ["date", "course", "off_time", "race_name"]:
-        if c not in merged.columns:
-            merged[c] = ""
 
     keep = [
         "date", "course", "off_time", "race_name", "race_id", "runner",
@@ -203,17 +188,17 @@ def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
             merged[c] = ""
 
     keep = [
-        "date", "course", "off_time", "race_name", "race_id", "runner",
-        "start_price_night_before", "price_30min_before", "pct_change", "direction",
-        "time_start", "time_30min_before",
+        "date", "course", "off_time", "race_name", "race_id,",
+        "runner", "start_price_night_before", "price_30min_before",
+        "pct_change", "direction", "time_start", "time_30min_before",
     ]
+
+    # fix accidental typo in keep list if present
+    keep = [c.replace("race_id,", "race_id") for c in keep]
     return merged[keep].sort_values("pct_change", ascending=True)
 
 
 def compute_persistent_shorteners(snap_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Persistence: look at last 4 snapshots and count how many times price decreased.
-    """
     if snap_df is None or snap_df.empty:
         return pd.DataFrame()
 
@@ -237,9 +222,20 @@ def build_signals(scored: pd.DataFrame, movers_2h: pd.DataFrame, movers_night: p
 
     df["value_edge"] = pd.to_numeric(df.get("value_edge", 0), errors="coerce").fillna(0.0)
 
-    m2 = movers_2h[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_2h_pct"}) if not movers_2h.empty else pd.DataFrame(columns=["race_id", "runner", "mover_2h_pct"])
-    mn = movers_night[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_night_pct"}) if not movers_night.empty else pd.DataFrame(columns=["race_id", "runner", "mover_night_pct"])
-    ps = persistence[["race_id", "runner", "shorten_steps_last4"]] if not persistence.empty else pd.DataFrame(columns=["race_id", "runner", "shorten_steps_last4"])
+    if movers_2h is None or movers_2h.empty:
+        m2 = pd.DataFrame(columns=["race_id", "runner", "mover_2h_pct"])
+    else:
+        m2 = movers_2h[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_2h_pct"})
+
+    if movers_night is None or movers_night.empty:
+        mn = pd.DataFrame(columns=["race_id", "runner", "mover_night_pct"])
+    else:
+        mn = movers_night[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_night_pct"})
+
+    if persistence is None or persistence.empty:
+        ps = pd.DataFrame(columns=["race_id", "runner", "shorten_steps_last4"])
+    else:
+        ps = persistence[["race_id", "runner", "shorten_steps_last4"]]
 
     for t in (m2, mn, ps):
         if not t.empty:
