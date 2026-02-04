@@ -28,7 +28,6 @@ def _normalize_off_time(s: str) -> str:
       "7.00" -> "07:00"
       "19.30" -> "19:30"
       "7:00" -> "07:00"
-    If it can't parse, return original string.
     """
     t = str(s).strip()
     if not t:
@@ -45,8 +44,8 @@ def _normalize_off_time(s: str) -> str:
 def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
     """
     Clean snapshots read from Google Sheets.
-    IMPORTANT: do NOT drop rows just because race datetime can't be parsed,
-    because MARKET_MOVERS_2H only needs snapshot times + prices.
+    - Always creates snapshot_local
+    - Tries to create race_dt (needed for night-before movers)
     """
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -60,24 +59,28 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
     df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce", utc=True)
     df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
+
     df = df.dropna(subset=["snapshot_time", "best_price_dec", "race_id", "runner"]).copy()
+
+    df["race_id"] = df["race_id"].astype(str).str.strip()
+    df["runner"] = df["runner"].astype(str).str.strip()
 
     df["snapshot_local"] = df["snapshot_time"].dt.tz_convert(TZ)
 
-    # Normalize off_time if present (helps night-before movers)
+    # Normalize off_time if present
     if "off_time" in df.columns:
         df["off_time_norm"] = df["off_time"].astype(str).apply(_normalize_off_time)
     else:
         df["off_time_norm"] = ""
 
-    # Build race_dt only when possible
+    # Build race_dt when possible (needed for night-before movers)
     df["race_dt"] = pd.NaT
     if "date" in df.columns and "off_time_norm" in df.columns:
         race_dt = pd.to_datetime(
             df["date"].astype(str) + " " + df["off_time_norm"].astype(str),
             errors="coerce",
         )
-        # localize if parse succeeded
+        # localize only where parsed
         race_dt = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
         df["race_dt"] = race_dt
 
@@ -87,9 +90,8 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
     """
     Official movers:
-      - Start price = first snapshot after 18:00 previous day (Dublin time)
-      - Pre-race price = last snapshot at or before off_time - 30 minutes
-    Requires race_dt.
+      - Start price = first snapshot AFTER 18:00 previous day (Dublin time)
+      - Pre-race price = last snapshot at/before off_time - 30 minutes
     """
     if df is None or df.empty or "race_dt" not in df.columns:
         return pd.DataFrame()
@@ -98,6 +100,7 @@ def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
     if d.empty:
         return pd.DataFrame()
 
+    # Windows
     d["night_start"] = (d["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=18)
     d["cutoff_30m"] = d["race_dt"] - pd.Timedelta(minutes=30)
 
@@ -145,33 +148,37 @@ def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
     return merged[keep].sort_values("pct_change", ascending=True)
 
 
-def compute_market_movers_last_2_hours(df: pd.DataFrame) -> pd.DataFrame:
+def compute_market_movers_live_last_two_snapshots(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Live movers:
-      - Price 2 hours ago = first snapshot at/after (now - 2h)
-      - Current price = latest snapshot
-    Does NOT require race_dt.
+    Live movers (robust, immediate):
+      - Uses the last TWO snapshots per runner (no time window)
+      - Populates as soon as there are >=2 snapshots
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    now_local = datetime.now(timezone.utc).astimezone(TZ)
-    window_start = now_local - pd.Timedelta(hours=2)
+    d = df.dropna(subset=["snapshot_local", "best_price_dec", "race_id", "runner"]).copy()
+    d = d.sort_values(["race_id", "runner", "snapshot_local"])
 
     key = ["race_id", "runner"]
 
-    recent = df[df["snapshot_local"] >= window_start].sort_values("snapshot_local")
-    if recent.empty:
+    last_two = d.groupby(key).tail(2).copy()
+    counts = last_two.groupby(key).size().reset_index(name="n")
+    valid = counts[counts["n"] >= 2][key]
+    if valid.empty:
         return pd.DataFrame()
 
-    start_2h = recent.groupby(key, as_index=False).first()
-    latest = df.sort_values("snapshot_local").groupby(key, as_index=False).last()
+    last_two = last_two.merge(valid, on=key, how="inner")
+    last_two["rn"] = last_two.groupby(key).cumcount()  # 0 then 1
 
-    merged = start_2h.merge(
-        latest[key + ["best_price_dec", "snapshot_local"]],
+    prev = last_two[last_two["rn"] == 0].copy()
+    curr = last_two[last_two["rn"] == 1].copy()
+
+    merged = prev.merge(
+        curr[key + ["best_price_dec", "snapshot_local", "date", "course", "off_time", "race_name"]],
         on=key,
         how="inner",
-        suffixes=("_2h", "_now"),
+        suffixes=("_prev", "_curr"),
     )
 
     if merged.empty:
@@ -179,26 +186,31 @@ def compute_market_movers_last_2_hours(df: pd.DataFrame) -> pd.DataFrame:
 
     merged = merged.rename(
         columns={
-            "best_price_dec_2h": "price_2h_ago",
-            "best_price_dec_now": "price_now",
-            "snapshot_local_2h": "time_2h_ago",
-            "snapshot_local_now": "time_now",
+            "best_price_dec_prev": "price_prev",
+            "best_price_dec_curr": "price_now",
+            "snapshot_local_prev": "time_prev",
+            "snapshot_local_curr": "time_now",
         }
     )
 
-    merged["pct_change_2h"] = (merged["price_now"] - merged["price_2h_ago"]) / merged["price_2h_ago"]
-    merged["direction_2h"] = merged["pct_change_2h"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
-
-    for c in ["date", "course", "off_time", "race_name"]:
-        if c not in merged.columns:
-            merged[c] = ""
+    merged["pct_change"] = (merged["price_now"] - merged["price_prev"]) / merged["price_prev"]
+    merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
 
     keep = [
-        "date", "course", "off_time", "race_name", "runner",
-        "price_2h_ago", "price_now", "pct_change_2h", "direction_2h",
-        "time_2h_ago", "time_now",
+        "date_curr", "course_curr", "off_time_curr", "race_name_curr", "runner",
+        "price_prev", "price_now", "pct_change", "direction",
+        "time_prev", "time_now",
     ]
-    return merged[keep].sort_values("pct_change_2h", ascending=True)
+    merged = merged[keep].rename(
+        columns={
+            "date_curr": "date",
+            "course_curr": "course",
+            "off_time_curr": "off_time",
+            "race_name_curr": "race_name",
+        }
+    )
+
+    return merged.sort_values("pct_change", ascending=True)
 
 
 def main() -> int:
@@ -223,6 +235,7 @@ def main() -> int:
 
     writer = SheetsWriter(sheet_name=sheet_name, credentials_path="credentials.json")
 
+    # Main tabs
     writer.write_df("TODAYS_RACES", races_df)
     writer.write_df("RUNNERS", scored)
     writer.write_df("VALUE_BETS", value_bets)
@@ -258,7 +271,7 @@ def main() -> int:
     has_header = isinstance(header, list) and ("snapshot_time" in header)
 
     if not (has_header and len(snap_vals) >= 2):
-        # self-heal
+        # self-heal and skip movers this run
         writer.write_df("MARKET_SNAPSHOTS", snapshots_new)
         writer.write_df("MARKET_MOVERS", pd.DataFrame())
         writer.write_df("MARKET_MOVERS_2H", pd.DataFrame())
@@ -268,11 +281,12 @@ def main() -> int:
     snap_df = pd.DataFrame(snap_vals[1:], columns=header)
     snap_df = _prep_snapshots_df(snap_df)
 
+    # Movers
     movers_night = compute_market_movers_night_before(snap_df)
-    movers_2h = compute_market_movers_last_2_hours(snap_df)
+    movers_live = compute_market_movers_live_last_two_snapshots(snap_df)
 
     writer.write_df("MARKET_MOVERS", movers_night)
-    writer.write_df("MARKET_MOVERS_2H", movers_2h)
+    writer.write_df("MARKET_MOVERS_2H", movers_live)
 
     print("Update complete.")
     return 0
