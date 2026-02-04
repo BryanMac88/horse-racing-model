@@ -22,53 +22,91 @@ def env(name: str, default: str | None = None) -> str:
     return v
 
 
-def _prep_snapshots_df(snapshots: pd.DataFrame) -> pd.DataFrame:
-    """Common cleaning for snapshots read from Google Sheets."""
-    if snapshots is None or snapshots.empty:
+def _normalize_off_time(s: str) -> str:
+    """
+    Convert times like:
+      "7.00" -> "07:00"
+      "19.30" -> "19:30"
+      "7:00" -> "07:00"
+    If it can't parse, return original string.
+    """
+    t = str(s).strip()
+    if not t:
+        return t
+    t = t.replace(".", ":")
+    m = pd.Series([t]).str.extract(r"^(\d{1,2}):(\d{2})$").iloc[0]
+    if pd.isna(m[0]) or pd.isna(m[1]):
+        return t
+    hh = int(m[0])
+    mm = int(m[1])
+    return f"{hh:02d}:{mm:02d}"
+
+
+def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean snapshots read from Google Sheets.
+    IMPORTANT: do NOT drop rows just because race datetime can't be parsed,
+    because MARKET_MOVERS_2H only needs snapshot times + prices.
+    """
+    if raw is None or raw.empty:
         return pd.DataFrame()
 
-    df = snapshots.copy()
+    df = raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    required = {"snapshot_time", "date", "off_time", "race_id", "runner", "best_price_dec"}
+    required = {"snapshot_time", "race_id", "runner", "best_price_dec"}
     if not required.issubset(set(df.columns)):
         return pd.DataFrame()
 
     df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce", utc=True)
     df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
-
-    df = df.dropna(subset=["snapshot_time", "best_price_dec", "date", "off_time", "race_id", "runner"]).copy()
-
-    # Race datetime in Dublin time
-    race_dt = pd.to_datetime(df["date"].astype(str) + " " + df["off_time"].astype(str), errors="coerce")
-    df = df[race_dt.notna()].copy()
-    df["race_dt"] = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
-    df = df[df["race_dt"].notna()].copy()
+    df = df.dropna(subset=["snapshot_time", "best_price_dec", "race_id", "runner"]).copy()
 
     df["snapshot_local"] = df["snapshot_time"].dt.tz_convert(TZ)
+
+    # Normalize off_time if present (helps night-before movers)
+    if "off_time" in df.columns:
+        df["off_time_norm"] = df["off_time"].astype(str).apply(_normalize_off_time)
+    else:
+        df["off_time_norm"] = ""
+
+    # Build race_dt only when possible
+    df["race_dt"] = pd.NaT
+    if "date" in df.columns and "off_time_norm" in df.columns:
+        race_dt = pd.to_datetime(
+            df["date"].astype(str) + " " + df["off_time_norm"].astype(str),
+            errors="coerce",
+        )
+        # localize if parse succeeded
+        race_dt = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
+        df["race_dt"] = race_dt
+
     return df
 
 
 def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
     """
     Official movers:
-      - Night before start price = first snapshot after 18:00 previous day (Dublin time)
-      - Pre-race price = last snapshot at or before off_time - 30 minutes (Dublin time)
+      - Start price = first snapshot after 18:00 previous day (Dublin time)
+      - Pre-race price = last snapshot at or before off_time - 30 minutes
+    Requires race_dt.
     """
-    if df is None or df.empty:
+    if df is None or df.empty or "race_dt" not in df.columns:
         return pd.DataFrame()
 
-    # Night before start = previous day 18:00 local
-    df = df.copy()
-    df["night_start"] = (df["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=18)
-    df["cutoff_30m"] = df["race_dt"] - pd.Timedelta(minutes=30)
+    d = df.dropna(subset=["race_dt"]).copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    d["night_start"] = (d["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=18)
+    d["cutoff_30m"] = d["race_dt"] - pd.Timedelta(minutes=30)
 
     key = ["race_id", "runner"]
 
-    night = df[df["snapshot_local"] >= df["night_start"]].sort_values("snapshot_local")
+    night = d[d["snapshot_local"] >= d["night_start"]].sort_values("snapshot_local")
     night_first = night.groupby(key, as_index=False).first()
 
-    pre = df[df["snapshot_local"] <= df["cutoff_30m"]].sort_values("snapshot_local")
+    pre = d[d["snapshot_local"] <= d["cutoff_30m"]].sort_values("snapshot_local")
     pre_last = pre.groupby(key, as_index=False).last()
 
     merged = night_first.merge(
@@ -112,7 +150,7 @@ def compute_market_movers_last_2_hours(df: pd.DataFrame) -> pd.DataFrame:
     Live movers:
       - Price 2 hours ago = first snapshot at/after (now - 2h)
       - Current price = latest snapshot
-    This gives you 'where the money is going RIGHT NOW' even without night-before history.
+    Does NOT require race_dt.
     """
     if df is None or df.empty:
         return pd.DataFrame()
@@ -120,14 +158,13 @@ def compute_market_movers_last_2_hours(df: pd.DataFrame) -> pd.DataFrame:
     now_local = datetime.now(timezone.utc).astimezone(TZ)
     window_start = now_local - pd.Timedelta(hours=2)
 
-    df = df.copy()
     key = ["race_id", "runner"]
 
-    # Only use snapshots within last 2 hours for the "start" point
     recent = df[df["snapshot_local"] >= window_start].sort_values("snapshot_local")
-    start_2h = recent.groupby(key, as_index=False).first()
+    if recent.empty:
+        return pd.DataFrame()
 
-    # Latest snapshot overall (current price)
+    start_2h = recent.groupby(key, as_index=False).first()
     latest = df.sort_values("snapshot_local").groupby(key, as_index=False).last()
 
     merged = start_2h.merge(
@@ -186,7 +223,6 @@ def main() -> int:
 
     writer = SheetsWriter(sheet_name=sheet_name, credentials_path="credentials.json")
 
-    # Overwrite standard tabs
     writer.write_df("TODAYS_RACES", races_df)
     writer.write_df("RUNNERS", scored)
     writer.write_df("VALUE_BETS", value_bets)
