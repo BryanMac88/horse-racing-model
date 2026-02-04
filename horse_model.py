@@ -22,20 +22,12 @@ def env(name: str, default: str | None = None) -> str:
     return v
 
 
-def compute_market_movers(snapshots: pd.DataFrame) -> pd.DataFrame:
-    """
-    Market movers comparing:
-      - night_before: first snapshot after 18:00 (previous day, Dublin time)
-      - pre_30m: last snapshot at or before race_time - 30 minutes (Dublin time)
-
-    Requires snapshot rows over time. Will be empty until you have enough history.
-    """
+def _prep_snapshots_df(snapshots: pd.DataFrame) -> pd.DataFrame:
+    """Common cleaning for snapshots read from Google Sheets."""
     if snapshots is None or snapshots.empty:
         return pd.DataFrame()
 
     df = snapshots.copy()
-
-    # Normalize column names just in case
     df.columns = [str(c).strip() for c in df.columns]
 
     required = {"snapshot_time", "date", "off_time", "race_id", "runner", "best_price_dec"}
@@ -44,28 +36,38 @@ def compute_market_movers(snapshots: pd.DataFrame) -> pd.DataFrame:
 
     df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce", utc=True)
     df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
+
     df = df.dropna(subset=["snapshot_time", "best_price_dec", "date", "off_time", "race_id", "runner"]).copy()
 
-    # Build race datetime in Dublin time
+    # Race datetime in Dublin time
     race_dt = pd.to_datetime(df["date"].astype(str) + " " + df["off_time"].astype(str), errors="coerce")
     df = df[race_dt.notna()].copy()
     df["race_dt"] = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
     df = df[df["race_dt"].notna()].copy()
 
     df["snapshot_local"] = df["snapshot_time"].dt.tz_convert(TZ)
+    return df
+
+
+def compute_market_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Official movers:
+      - Night before start price = first snapshot after 18:00 previous day (Dublin time)
+      - Pre-race price = last snapshot at or before off_time - 30 minutes (Dublin time)
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
 
     # Night before start = previous day 18:00 local
+    df = df.copy()
     df["night_start"] = (df["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(hours=18)
-    # 30 minutes before off
     df["cutoff_30m"] = df["race_dt"] - pd.Timedelta(minutes=30)
 
     key = ["race_id", "runner"]
 
-    # night_before: first snapshot after night_start
     night = df[df["snapshot_local"] >= df["night_start"]].sort_values("snapshot_local")
     night_first = night.groupby(key, as_index=False).first()
 
-    # pre_30m: last snapshot <= cutoff_30m
     pre = df[df["snapshot_local"] <= df["cutoff_30m"]].sort_values("snapshot_local")
     pre_last = pre.groupby(key, as_index=False).last()
 
@@ -81,29 +83,85 @@ def compute_market_movers(snapshots: pd.DataFrame) -> pd.DataFrame:
 
     merged = merged.rename(
         columns={
-            "best_price_dec_night": "price_night_before",
+            "best_price_dec_night": "start_price_night_before",
             "best_price_dec_30m": "price_30min_before",
-            "snapshot_local_night": "time_night_before",
+            "snapshot_local_night": "time_start_night_before",
             "snapshot_local_30m": "time_30min_before",
         }
     )
 
-    merged["pct_change"] = (merged["price_30min_before"] - merged["price_night_before"]) / merged["price_night_before"]
+    merged["pct_change"] = (
+        (merged["price_30min_before"] - merged["start_price_night_before"]) / merged["start_price_night_before"]
+    )
     merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
 
-    # Keep readable race columns if present
     for c in ["date", "course", "off_time", "race_name"]:
         if c not in merged.columns:
             merged[c] = ""
 
-    keep_cols = [
+    keep = [
         "date", "course", "off_time", "race_name", "runner",
-        "price_night_before", "price_30min_before", "pct_change", "direction",
-        "time_night_before", "time_30min_before",
+        "start_price_night_before", "price_30min_before", "pct_change", "direction",
+        "time_start_night_before", "time_30min_before",
     ]
+    return merged[keep].sort_values("pct_change", ascending=True)
 
-    merged = merged[keep_cols].sort_values("pct_change", ascending=True)  # most negative = biggest shorten
-    return merged
+
+def compute_market_movers_last_2_hours(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Live movers:
+      - Price 2 hours ago = first snapshot at/after (now - 2h)
+      - Current price = latest snapshot
+    This gives you 'where the money is going RIGHT NOW' even without night-before history.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    now_local = datetime.now(timezone.utc).astimezone(TZ)
+    window_start = now_local - pd.Timedelta(hours=2)
+
+    df = df.copy()
+    key = ["race_id", "runner"]
+
+    # Only use snapshots within last 2 hours for the "start" point
+    recent = df[df["snapshot_local"] >= window_start].sort_values("snapshot_local")
+    start_2h = recent.groupby(key, as_index=False).first()
+
+    # Latest snapshot overall (current price)
+    latest = df.sort_values("snapshot_local").groupby(key, as_index=False).last()
+
+    merged = start_2h.merge(
+        latest[key + ["best_price_dec", "snapshot_local"]],
+        on=key,
+        how="inner",
+        suffixes=("_2h", "_now"),
+    )
+
+    if merged.empty:
+        return pd.DataFrame()
+
+    merged = merged.rename(
+        columns={
+            "best_price_dec_2h": "price_2h_ago",
+            "best_price_dec_now": "price_now",
+            "snapshot_local_2h": "time_2h_ago",
+            "snapshot_local_now": "time_now",
+        }
+    )
+
+    merged["pct_change_2h"] = (merged["price_now"] - merged["price_2h_ago"]) / merged["price_2h_ago"]
+    merged["direction_2h"] = merged["pct_change_2h"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
+
+    for c in ["date", "course", "off_time", "race_name"]:
+        if c not in merged.columns:
+            merged[c] = ""
+
+    keep = [
+        "date", "course", "off_time", "race_name", "runner",
+        "price_2h_ago", "price_now", "pct_change_2h", "direction_2h",
+        "time_2h_ago", "time_now",
+    ]
+    return merged[keep].sort_values("pct_change_2h", ascending=True)
 
 
 def main() -> int:
@@ -141,39 +199,44 @@ def main() -> int:
         "value_bets": int(len(value_bets)),
     }]))
 
-    # Build snapshot rows for this run
-    snapshots = scored[[
+    # Snapshot rows for this run
+    snapshots_new = scored[[
         "date", "course", "off_time", "race_name", "race_id", "runner", "best_price_dec"
     ]].copy()
-    snapshots.insert(0, "snapshot_time", now_utc.isoformat(timespec="seconds"))
+    snapshots_new.insert(0, "snapshot_time", now_utc.isoformat(timespec="seconds"))
 
-    # Append snapshots (or create if missing)
+    # Append snapshots (or create if missing/broken)
     try:
-        writer.append_df("MARKET_SNAPSHOTS", snapshots)
+        writer.append_df("MARKET_SNAPSHOTS", snapshots_new)
     except Exception:
-        # If something is weird with the tab, overwrite it cleanly
-        writer.write_df("MARKET_SNAPSHOTS", snapshots)
+        writer.write_df("MARKET_SNAPSHOTS", snapshots_new)
 
-    # Read snapshots back and compute movers
+    # Read snapshots back
     try:
         snap_ws = writer.book.worksheet("MARKET_SNAPSHOTS")
         snap_vals = snap_ws.get_all_values()
     except Exception:
         snap_vals = []
 
-    # --- SELF-HEALING HEADER LOGIC ---
     header = snap_vals[0] if snap_vals else []
     has_header = isinstance(header, list) and ("snapshot_time" in header)
 
-    if has_header and len(snap_vals) >= 2:
-        snap_df = pd.DataFrame(snap_vals[1:], columns=header)
-        movers = compute_market_movers(snap_df)
-        writer.write_df("MARKET_MOVERS", movers)
-    else:
-        # Old/invalid snapshot sheet format: rewrite it cleanly and skip movers this run
-        writer.write_df("MARKET_SNAPSHOTS", snapshots)
+    if not (has_header and len(snap_vals) >= 2):
+        # self-heal
+        writer.write_df("MARKET_SNAPSHOTS", snapshots_new)
         writer.write_df("MARKET_MOVERS", pd.DataFrame())
-    # --------------------------------
+        writer.write_df("MARKET_MOVERS_2H", pd.DataFrame())
+        print("Update complete (snapshots healed; movers pending).")
+        return 0
+
+    snap_df = pd.DataFrame(snap_vals[1:], columns=header)
+    snap_df = _prep_snapshots_df(snap_df)
+
+    movers_night = compute_market_movers_night_before(snap_df)
+    movers_2h = compute_market_movers_last_2_hours(snap_df)
+
+    writer.write_df("MARKET_MOVERS", movers_night)
+    writer.write_df("MARKET_MOVERS_2H", movers_2h)
 
     print("Update complete.")
     return 0
