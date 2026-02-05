@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -79,10 +79,7 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Immediate movers: last TWO snapshots per runner.
-    Robust against suffix/rename differences.
-    """
+    """Immediate movers: last TWO snapshots per runner."""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -91,7 +88,6 @@ def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
 
     key = ["race_id", "runner"]
 
-    # last two snapshots per runner
     last_two = d.groupby(key).tail(2).copy()
     counts = last_two.groupby(key).size().reset_index(name="n")
     valid = counts[counts["n"] >= 2][key]
@@ -104,7 +100,6 @@ def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
     prev = last_two[last_two["rn"] == 0].copy()
     curr = last_two[last_two["rn"] == 1].copy()
 
-    # Build a "current" table with consistent column names
     curr_out = curr[key].copy()
     curr_out["price_now"] = curr["best_price_dec"].values
     curr_out["time_now"] = curr["snapshot_local"].values
@@ -122,7 +117,6 @@ def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
     merged["pct_change"] = (merged["price_now"] - merged["price_prev"]) / merged["price_prev"]
     merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
 
-    # filter noise
     merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
 
     keep = [
@@ -163,7 +157,6 @@ def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
         how="inner",
         suffixes=("_start", "_30m"),
     )
-
     if merged.empty:
         return pd.DataFrame()
 
@@ -188,13 +181,10 @@ def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
             merged[c] = ""
 
     keep = [
-        "date", "course", "off_time", "race_name", "race_id,",
+        "date", "course", "off_time", "race_name", "race_id",
         "runner", "start_price_night_before", "price_30min_before",
         "pct_change", "direction", "time_start", "time_30min_before",
     ]
-
-    # fix accidental typo in keep list if present
-    keep = [c.replace("race_id,", "race_id") for c in keep]
     return merged[keep].sort_values("pct_change", ascending=True)
 
 
@@ -210,8 +200,7 @@ def compute_persistent_shorteners(snap_df: pd.DataFrame) -> pd.DataFrame:
     last4["prev_price"] = last4.groupby(key)["best_price_dec"].shift(1)
     last4["down"] = (last4["best_price_dec"] < last4["prev_price"]).astype(int)
 
-    pers = last4.groupby(key, as_index=False)["down"].sum().rename(columns={"down": "shorten_steps_last4"})
-    return pers
+    return last4.groupby(key, as_index=False)["down"].sum().rename(columns={"down": "shorten_steps_last4"})
 
 
 def build_signals(scored: pd.DataFrame, movers_2h: pd.DataFrame, movers_night: pd.DataFrame, persistence: pd.DataFrame) -> pd.DataFrame:
@@ -333,8 +322,8 @@ def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> No
 def build_dashboard(races: pd.DataFrame, runners: pd.DataFrame, movers2h: pd.DataFrame, moversnight: pd.DataFrame, bets: pd.DataFrame) -> pd.DataFrame:
     rows = []
     rows.append({"metric": "last_run_local", "value": datetime.now(timezone.utc).astimezone(TZ).isoformat(timespec="seconds")})
-    rows.append({"metric": "races_today", "value": int(len(races)) if races is not None else 0})
-    rows.append({"metric": "runners_today", "value": int(len(runners)) if runners is not None else 0})
+    rows.append({"metric": "races_target_day", "value": int(len(races)) if races is not None else 0})
+    rows.append({"metric": "runners_target_day", "value": int(len(runners)) if runners is not None else 0})
     rows.append({"metric": "movers_2h_rows", "value": int(len(movers2h)) if movers2h is not None else 0})
     rows.append({"metric": "movers_night_rows", "value": int(len(moversnight)) if moversnight is not None else 0})
     rows.append({"metric": "bets_to_place", "value": int(len(bets)) if bets is not None else 0})
@@ -348,9 +337,19 @@ def main() -> int:
 
     client = IrishRacingClient(region=region)
 
-    races_df, runners_df = client.fetch_today()
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(TZ)
+    today = now_local.date()
+    tomorrow = today + timedelta(days=1)
+
+    # ✅ After 22:00, snapshot tomorrow's racecard (night-before starting price)
+    target_date = tomorrow if now_local.hour >= NIGHT_BEFORE_HOUR else today
+    target_label = "TOMORROW" if target_date == tomorrow else "TODAY"
+
+    # pull the correct day
+    races_df, runners_df = client.fetch_for_date(target_date)
     if races_df.empty or runners_df.empty:
-        print("No races/runners found.")
+        print(f"No races/runners found for target_date={target_date} ({target_label}).")
         return 0
 
     runners_df = client.enrich_with_best_prices(runners_df)
@@ -358,18 +357,28 @@ def main() -> int:
     scored = build_runner_scores(runners_df)
     value_bets = build_value_bets(scored, min_edge=min_edge)
 
-    now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.astimezone(TZ)
-
     writer = SheetsWriter(sheet_name=sheet_name, credentials_path="credentials.json")
 
+    # helpful visibility tab
+    writer.write_df("TARGET_DAY", pd.DataFrame([{
+        "run_utc": now_utc.isoformat(timespec="seconds"),
+        "run_local": now_local.isoformat(timespec="seconds"),
+        "target_label": target_label,
+        "target_date": target_date.isoformat(),
+        "night_before_hour_local": NIGHT_BEFORE_HOUR,
+    }]))
+
+    # keep these as "current working set"
     writer.write_df("TODAYS_RACES", races_df)
     writer.write_df("RUNNERS", scored)
     writer.write_df("VALUE_BETS", value_bets)
+
     writer.write_df("RUN_LOG", pd.DataFrame([{
         "run_utc": now_utc.isoformat(timespec="seconds"),
         "run_local": now_local.isoformat(timespec="seconds"),
         "region": region,
+        "target_label": target_label,
+        "target_date": target_date.isoformat(),
         "races": int(len(races_df)),
         "runners": int(len(scored)),
         "night_before_hour_local": NIGHT_BEFORE_HOUR,
@@ -377,11 +386,12 @@ def main() -> int:
         "max_runners_for_signal": MAX_RUNNERS_FOR_SIGNAL,
     }]))
 
-    # snapshots append
+    # snapshots append (now includes which day we targeted)
     snapshots_new = scored[[
         "date", "course", "off_time", "race_name", "race_id", "runner", "best_price_dec"
     ]].copy()
     snapshots_new.insert(0, "snapshot_time", now_utc.isoformat(timespec="seconds"))
+    snapshots_new.insert(1, "target_label", target_label)
 
     try:
         writer.append_df("MARKET_SNAPSHOTS", snapshots_new)
