@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Tuple
+from datetime import datetime, date, timedelta
+from typing import Tuple, Union
 
 import pandas as pd
 import requests
@@ -31,16 +31,31 @@ def _frac_to_decimal(frac: str) -> float | None:
         return None
 
 
-def _today_label() -> str:
-    # Example: Wed-4th-Feb-2026
-    dt = datetime.now()
-    day = dt.day
-    suffix = "th"
+def _suffix(day: int) -> str:
     if 10 <= day % 100 <= 20:
-        suffix = "th"
-    else:
-        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
-    return f"{dt.strftime('%a')}-{day}{suffix}-{dt.strftime('%b')}-{dt.strftime('%Y')}"
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+
+
+def _date_label(d: date) -> str:
+    """
+    IrishRacing date label format used in URLs:
+      Wed-4th-Feb-2026
+    """
+    day = d.day
+    return f"{d.strftime('%a')}-{day}{_suffix(day)}-{d.strftime('%b')}-{d.strftime('%Y')}"
+
+
+def _parse_date_input(d: Union[str, date]) -> date:
+    """
+    Accepts:
+      - YYYY-MM-DD string
+      - datetime.date
+    """
+    if isinstance(d, date):
+        return d
+    # string
+    return datetime.strptime(str(d), "%Y-%m-%d").date()
 
 
 @dataclass(frozen=True)
@@ -64,15 +79,30 @@ class IrishRacingClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": UA})
 
+    # -------------------------
+    # Public API
+    # -------------------------
     def fetch_today(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Backwards compatible: fetch races/runners for today (local machine date)."""
+        today = datetime.now().date()
+        return self.fetch_for_date(today)
+
+    def fetch_tomorrow(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Fetch races/runners for tomorrow."""
+        tomorrow = datetime.now().date() + timedelta(days=1)
+        return self.fetch_for_date(tomorrow)
+
+    def fetch_for_date(self, d: Union[str, date]) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Pull TODAY by date label page:
+        Pull racecards for a specific date (YYYY-MM-DD or date object):
           /racecards/<DATE_LABEL>
         Then for each meeting:
           /racecards/<DATE_LABEL>/<COURSE>
         We parse runners + "Probable SP" from the course page.
         """
-        date_label = _today_label()
+        target_date = _parse_date_input(d)
+        date_label = _date_label(target_date)
+
         day_url = f"{BASE}/racecards/{date_label}"
 
         html = self.session.get(day_url, timeout=self.timeout).text
@@ -140,8 +170,6 @@ class IrishRacingClient:
                 continue
             off_time = m_time.group(1)
 
-            # Race name: often appears immediately after time as a line with words
-            # We take the first non-empty line after time that isn't "No" / "Form"
             lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
             if len(lines) < 3:
                 continue
@@ -157,7 +185,6 @@ class IrishRacingClient:
                 race_name = ln
                 break
 
-            # Distance often like "6f." or "2m. 3f. 17yds."
             dist = ""
             m_dist = re.search(r"(\d+m\.\s*\d+f\.\s*\d+yds\.|\d+m\.\s*\d+f\.|\d+f\.)", block)
             if m_dist:
@@ -168,14 +195,11 @@ class IrishRacingClient:
             if m_class:
                 class_band = f"Class {m_class.group(1)}"
 
-            # Probable SP line
             m_psp = re.search(r"Probable SP\s*-\s*(.+)", block)
             if not m_psp:
-                # no market line -> skip (usually means page section not a proper race)
                 continue
             psp = m_psp.group(1)
 
-            # Build a race key we can group on
             race_key = f"{course}_{off_time}_{re.sub(r'[^A-Za-z0-9]+','_',race_name)[:40]}"
 
             races_rows.append({
@@ -191,8 +215,6 @@ class IrishRacingClient:
                 "race_id": race_key,
             })
 
-            # Parse Probable SP list: "7/4 Teardrops, 9/2 Laurens Dream, 5/1 Asadjumeirah, ..."
-            # We'll map horse -> frac odds.
             horse_to_odds = {}
             for part in psp.split(","):
                 part = part.strip()
@@ -201,14 +223,10 @@ class IrishRacingClient:
                     continue
                 frac = m.group(1).strip()
                 name = _clean(m.group(2))
-                # remove trailing "Others."
                 name = re.sub(r"\.\s*$", "", name)
                 horse_to_odds[name.lower()] = frac
 
-            # Runner names appear in the block as standalone lines with trainer/jockey/OR nearby.
-            # We'll take candidates that look like a name and exist in horse_to_odds (best effort).
             for ln in lines:
-                # likely horse line contains letters and not too long
                 if len(ln) < 2 or len(ln) > 60:
                     continue
                 if ln.lower().startswith("probable sp"):
@@ -216,7 +234,6 @@ class IrishRacingClient:
                 if re.search(r"\b(Probable|Image:|Midnite|Handicap|Maiden|Novice|H'cap|Stakes)\b", ln, re.IGNORECASE):
                     continue
 
-                # if this line matches a horse in the odds list, keep it
                 key = ln.lower()
                 if key in horse_to_odds:
                     frac = horse_to_odds[key]
