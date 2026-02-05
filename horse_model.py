@@ -14,8 +14,8 @@ TZ = ZoneInfo("Europe/Dublin")
 NIGHT_BEFORE_HOUR = 22  # 22:00 Dublin time
 
 # Filters / tuning
-MIN_MOVE_PCT = 0.02          # ignore tiny moves under 2% (noise)
-MAX_RUNNERS_FOR_SIGNAL = 18  # big fields produce lots of false shorteners
+MIN_MOVE_PCT = 0.02
+MAX_RUNNERS_FOR_SIGNAL = 18
 
 
 def env(name: str, default: str | None = None) -> str:
@@ -35,8 +35,7 @@ def _normalize_off_time(s: str) -> str:
     m = pd.Series([t]).str.extract(r"^(\d{1,2}):(\d{2})$").iloc[0]
     if pd.isna(m[0]) or pd.isna(m[1]):
         return t
-    hh = int(m[0])
-    mm = int(m[1])
+    hh = int(m[0]); mm = int(m[1])
     return f"{hh:02d}:{mm:02d}"
 
 
@@ -57,10 +56,8 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
     df["race_id"] = df["race_id"].astype(str).str.strip()
     df["runner"] = df["runner"].astype(str).str.strip()
-
     df["snapshot_local"] = df["snapshot_time"].dt.tz_convert(TZ)
 
-    # normalize off_time for race_dt parsing (needed for night-before movers)
     if "off_time" in df.columns:
         df["off_time_norm"] = df["off_time"].astype(str).apply(_normalize_off_time)
     else:
@@ -68,10 +65,7 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
     df["race_dt"] = pd.NaT
     if "date" in df.columns and "off_time_norm" in df.columns:
-        race_dt = pd.to_datetime(
-            df["date"].astype(str) + " " + df["off_time_norm"].astype(str),
-            errors="coerce",
-        )
+        race_dt = pd.to_datetime(df["date"].astype(str) + " " + df["off_time_norm"].astype(str), errors="coerce")
         race_dt = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
         df["race_dt"] = race_dt
 
@@ -79,7 +73,6 @@ def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
-    """Immediate movers: last TWO snapshots per runner."""
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -95,7 +88,7 @@ def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     last_two = last_two.merge(valid, on=key, how="inner")
-    last_two["rn"] = last_two.groupby(key).cumcount()  # 0 then 1
+    last_two["rn"] = last_two.groupby(key).cumcount()
 
     prev = last_two[last_two["rn"] == 0].copy()
     curr = last_two[last_two["rn"] == 1].copy()
@@ -116,23 +109,14 @@ def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
 
     merged["pct_change"] = (merged["price_now"] - merged["price_prev"]) / merged["price_prev"]
     merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
-
     merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
 
-    keep = [
-        "date", "course", "off_time", "race_name", "race_id", "runner",
-        "price_prev", "price_now", "pct_change", "direction",
-        "time_prev", "time_now",
-    ]
+    keep = ["date", "course", "off_time", "race_name", "race_id", "runner",
+            "price_prev", "price_now", "pct_change", "direction", "time_prev", "time_now"]
     return merged[keep].sort_values("pct_change", ascending=True)
 
 
 def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Official movers:
-      - Start price = first snapshot after 22:00 previous day (Dublin time)
-      - Pre-race price = last snapshot <= off_time - 30 minutes
-    """
     if df is None or df.empty or "race_dt" not in df.columns:
         return pd.DataFrame()
 
@@ -153,38 +137,29 @@ def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
 
     merged = night_first.merge(
         pre_last[key + ["best_price_dec", "snapshot_local"]],
-        on=key,
-        how="inner",
-        suffixes=("_start", "_30m"),
+        on=key, how="inner", suffixes=("_start", "_30m")
     )
     if merged.empty:
         return pd.DataFrame()
 
-    merged = merged.rename(
-        columns={
-            "best_price_dec_start": "start_price_night_before",
-            "best_price_dec_30m": "price_30min_before",
-            "snapshot_local_start": "time_start",
-            "snapshot_local_30m": "time_30min_before",
-        }
-    )
+    merged = merged.rename(columns={
+        "best_price_dec_start": "start_price_night_before",
+        "best_price_dec_30m": "price_30min_before",
+        "snapshot_local_start": "time_start",
+        "snapshot_local_30m": "time_30min_before",
+    })
 
-    merged["pct_change"] = (
-        (merged["price_30min_before"] - merged["start_price_night_before"]) / merged["start_price_night_before"]
-    )
+    merged["pct_change"] = (merged["price_30min_before"] - merged["start_price_night_before"]) / merged["start_price_night_before"]
     merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
-
     merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
 
     for c in ["date", "course", "off_time", "race_name"]:
         if c not in merged.columns:
             merged[c] = ""
 
-    keep = [
-        "date", "course", "off_time", "race_name", "race_id",
-        "runner", "start_price_night_before", "price_30min_before",
-        "pct_change", "direction", "time_start", "time_30min_before",
-    ]
+    keep = ["date", "course", "off_time", "race_name", "race_id", "runner",
+            "start_price_night_before", "price_30min_before", "pct_change", "direction",
+            "time_start", "time_30min_before"]
     return merged[keep].sort_values("pct_change", ascending=True)
 
 
@@ -205,26 +180,13 @@ def compute_persistent_shorteners(snap_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_signals(scored: pd.DataFrame, movers_2h: pd.DataFrame, movers_night: pd.DataFrame, persistence: pd.DataFrame) -> pd.DataFrame:
     df = scored.copy()
-
     df["runner_count"] = pd.to_numeric(df.get("runner_count", 0), errors="coerce").fillna(0)
     df = df[df["runner_count"] <= MAX_RUNNERS_FOR_SIGNAL].copy()
-
     df["value_edge"] = pd.to_numeric(df.get("value_edge", 0), errors="coerce").fillna(0.0)
 
-    if movers_2h is None or movers_2h.empty:
-        m2 = pd.DataFrame(columns=["race_id", "runner", "mover_2h_pct"])
-    else:
-        m2 = movers_2h[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_2h_pct"})
-
-    if movers_night is None or movers_night.empty:
-        mn = pd.DataFrame(columns=["race_id", "runner", "mover_night_pct"])
-    else:
-        mn = movers_night[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_night_pct"})
-
-    if persistence is None or persistence.empty:
-        ps = pd.DataFrame(columns=["race_id", "runner", "shorten_steps_last4"])
-    else:
-        ps = persistence[["race_id", "runner", "shorten_steps_last4"]]
+    m2 = movers_2h[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_2h_pct"}) if not movers_2h.empty else pd.DataFrame(columns=["race_id","runner","mover_2h_pct"])
+    mn = movers_night[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_night_pct"}) if not movers_night.empty else pd.DataFrame(columns=["race_id","runner","mover_night_pct"])
+    ps = persistence if not persistence.empty else pd.DataFrame(columns=["race_id","runner","shorten_steps_last4"])
 
     for t in (m2, mn, ps):
         if not t.empty:
@@ -234,9 +196,7 @@ def build_signals(scored: pd.DataFrame, movers_2h: pd.DataFrame, movers_night: p
     df["race_id"] = df["race_id"].astype(str).str.strip()
     df["runner"] = df["runner"].astype(str).str.strip()
 
-    out = df.merge(m2, on=["race_id", "runner"], how="left") \
-            .merge(mn, on=["race_id", "runner"], how="left") \
-            .merge(ps, on=["race_id", "runner"], how="left")
+    out = df.merge(m2, on=["race_id","runner"], how="left").merge(mn, on=["race_id","runner"], how="left").merge(ps, on=["race_id","runner"], how="left")
 
     out["mover_2h_pct"] = pd.to_numeric(out.get("mover_2h_pct", 0), errors="coerce").fillna(0.0)
     out["mover_night_pct"] = pd.to_numeric(out.get("mover_night_pct", 0), errors="coerce").fillna(0.0)
@@ -252,17 +212,7 @@ def build_signals(scored: pd.DataFrame, movers_2h: pd.DataFrame, movers_night: p
         0.15 * out["shorten_steps_last4"]
     )
 
-    out = out.sort_values(["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False])
-
-    cols = [
-        "date", "course", "off_time", "race_name", "race_id",
-        "runner", "best_price_dec",
-        "model_prob", "market_prob", "value_edge",
-        "mover_2h_pct", "mover_night_pct", "shorten_steps_last4",
-        "signal_score", "confidence", "runner_count",
-    ]
-    cols = [c for c in cols if c in out.columns] + [c for c in out.columns if c not in cols]
-    return out[cols]
+    return out.sort_values(["date","course","off_time","signal_score"], ascending=[True,True,True,False])
 
 
 def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
@@ -285,7 +235,7 @@ def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
 
     df["suggested_stake_units"] = 1
     df["bet_key"] = df["date"].astype(str) + "|" + df["course"].astype(str) + "|" + df["off_time"].astype(str) + "|" + df["runner"].astype(str)
-    return df.sort_values(["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False])
+    return df.sort_values(["date","course","off_time","signal_score"], ascending=[True,True,True,False])
 
 
 def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> None:
@@ -293,9 +243,7 @@ def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> No
         return
 
     existing = writer.read_df("BET_RECS_LOG")
-    existing_keys = set()
-    if not existing.empty and "bet_key" in existing.columns:
-        existing_keys = set(existing["bet_key"].astype(str).tolist())
+    existing_keys = set(existing["bet_key"].astype(str).tolist()) if (not existing.empty and "bet_key" in existing.columns) else set()
 
     new_rows = bets_to_place[~bets_to_place["bet_key"].astype(str).isin(existing_keys)].copy()
     if new_rows.empty:
@@ -304,19 +252,16 @@ def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> No
     out = pd.DataFrame()
     out["timestamp_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     out["bet_key"] = new_rows["bet_key"]
-    for c in ["date", "course", "off_time", "race_name", "runner", "best_price_dec", "signal_score", "value_edge",
-              "mover_2h_pct", "mover_night_pct", "shorten_steps_last4", "suggested_stake_units"]:
+    for c in ["date","course","off_time","race_name","runner","best_price_dec","signal_score","value_edge","mover_2h_pct","mover_night_pct","shorten_steps_last4","suggested_stake_units"]:
         out[c] = new_rows.get(c, "")
-
     out["result"] = ""
     out["pnl_units"] = ""
     out["notes"] = ""
 
-    cols = ["timestamp_utc", "bet_key", "date", "course", "off_time", "race_name", "runner",
-            "best_price_dec", "signal_score", "value_edge", "mover_2h_pct", "mover_night_pct",
-            "shorten_steps_last4", "suggested_stake_units", "result", "pnl_units", "notes"]
-    out = out[cols]
-    writer.append_df("BET_RECS_LOG", out)
+    cols = ["timestamp_utc","bet_key","date","course","off_time","race_name","runner",
+            "best_price_dec","signal_score","value_edge","mover_2h_pct","mover_night_pct",
+            "shorten_steps_last4","suggested_stake_units","result","pnl_units","notes"]
+    writer.append_df("BET_RECS_LOG", out[cols])
 
 
 def build_dashboard(races: pd.DataFrame, runners: pd.DataFrame, movers2h: pd.DataFrame, moversnight: pd.DataFrame, bets: pd.DataFrame) -> pd.DataFrame:
@@ -339,14 +284,14 @@ def main() -> int:
 
     now_utc = datetime.now(timezone.utc)
     now_local = now_utc.astimezone(TZ)
+
     today = now_local.date()
     tomorrow = today + timedelta(days=1)
 
-    # ✅ After 22:00, snapshot tomorrow's racecard (night-before starting price)
+    # ✅ KEY: after 22:00, snapshot tomorrow (night-before start price)
     target_date = tomorrow if now_local.hour >= NIGHT_BEFORE_HOUR else today
     target_label = "TOMORROW" if target_date == tomorrow else "TODAY"
 
-    # pull the correct day
     races_df, runners_df = client.fetch_for_date(target_date)
     if races_df.empty or runners_df.empty:
         print(f"No races/runners found for target_date={target_date} ({target_label}).")
@@ -359,7 +304,7 @@ def main() -> int:
 
     writer = SheetsWriter(sheet_name=sheet_name, credentials_path="credentials.json")
 
-    # helpful visibility tab
+    # show what day we're pulling
     writer.write_df("TARGET_DAY", pd.DataFrame([{
         "run_utc": now_utc.isoformat(timespec="seconds"),
         "run_local": now_local.isoformat(timespec="seconds"),
@@ -368,52 +313,26 @@ def main() -> int:
         "night_before_hour_local": NIGHT_BEFORE_HOUR,
     }]))
 
-    # keep these as "current working set"
-    writer.write_df("TODAYS_RACES", races_df)
-    writer.write_df("RUNNERS", scored)
-    writer.write_df("VALUE_BETS", value_bets)
+    # working set tabs
+    writer.write_df("RACES_TARGET", races_df)
+    writer.write_df("RUNNERS_TARGET", scored)
+    writer.write_df("VALUE_BETS_TARGET", value_bets)
 
-    writer.write_df("RUN_LOG", pd.DataFrame([{
-        "run_utc": now_utc.isoformat(timespec="seconds"),
-        "run_local": now_local.isoformat(timespec="seconds"),
-        "region": region,
-        "target_label": target_label,
-        "target_date": target_date.isoformat(),
-        "races": int(len(races_df)),
-        "runners": int(len(scored)),
-        "night_before_hour_local": NIGHT_BEFORE_HOUR,
-        "min_move_pct": MIN_MOVE_PCT,
-        "max_runners_for_signal": MAX_RUNNERS_FOR_SIGNAL,
-    }]))
-
-    # snapshots append (now includes which day we targeted)
-    snapshots_new = scored[[
-        "date", "course", "off_time", "race_name", "race_id", "runner", "best_price_dec"
-    ]].copy()
+    # snapshots: overwrite TARGET snapshot + append to LOG
+    snapshots_new = scored[["date","course","off_time","race_name","race_id","runner","best_price_dec"]].copy()
     snapshots_new.insert(0, "snapshot_time", now_utc.isoformat(timespec="seconds"))
     snapshots_new.insert(1, "target_label", target_label)
 
-    try:
-        writer.append_df("MARKET_SNAPSHOTS", snapshots_new)
-    except Exception:
-        writer.write_df("MARKET_SNAPSHOTS", snapshots_new)
+    writer.write_df("MARKET_SNAPSHOTS_TARGET", snapshots_new)          # clean view (what you want)
+    writer.append_df("MARKET_SNAPSHOTS_LOG", snapshots_new)            # history log (optional)
 
-    snap_df_raw = writer.read_df("MARKET_SNAPSHOTS")
-    if snap_df_raw.empty or "snapshot_time" not in snap_df_raw.columns:
-        writer.write_df("MARKET_SNAPSHOTS", snapshots_new)
-        writer.write_df("MARKET_MOVERS", pd.DataFrame())
-        writer.write_df("MARKET_MOVERS_2H", pd.DataFrame())
-        writer.write_df("SIGNALS", pd.DataFrame())
-        writer.write_df("BETS_TO_PLACE", pd.DataFrame())
-        writer.write_df("DASHBOARD", build_dashboard(races_df, scored, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()))
-        print("Update complete (snapshots healed; movers/signals pending).")
-        return 0
+    # Movers/signals based ONLY on target day snapshot set
+    snap_df = _prep_snapshots_df(writer.read_df("MARKET_SNAPSHOTS_LOG"))
+    snap_target = _prep_snapshots_df(writer.read_df("MARKET_SNAPSHOTS_TARGET"))
 
-    snap_df = _prep_snapshots_df(snap_df_raw)
-
-    movers_2h = compute_movers_last_two(snap_df)
-    movers_night = compute_movers_night_before(snap_df)
-    persistence = compute_persistent_shorteners(snap_df)
+    movers_2h = compute_movers_last_two(snap_target)
+    movers_night = compute_movers_night_before(snap_target)
+    persistence = compute_persistent_shorteners(snap_target)
 
     writer.write_df("MARKET_MOVERS_2H", movers_2h)
     writer.write_df("MARKET_MOVERS", movers_night)
@@ -428,6 +347,16 @@ def main() -> int:
 
     dashboard = build_dashboard(races_df, scored, movers_2h, movers_night, bets_to_place)
     writer.write_df("DASHBOARD", dashboard)
+
+    writer.write_df("RUN_LOG", pd.DataFrame([{
+        "run_utc": now_utc.isoformat(timespec="seconds"),
+        "run_local": now_local.isoformat(timespec="seconds"),
+        "region": region,
+        "target_label": target_label,
+        "target_date": target_date.isoformat(),
+        "races": int(len(races_df)),
+        "runners": int(len(scored)),
+    }]))
 
     print("Update complete.")
     return 0
