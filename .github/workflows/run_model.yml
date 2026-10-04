@@ -2,13 +2,14 @@ name: Horse Racing Model
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    # Every 20 minutes during typical racing hours (UTC). Adjust if you want.
+    - cron: "*/20 * * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -18,7 +19,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run model + update sheet
         env:
