@@ -271,6 +271,7 @@ def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
     df["mover_2h_pct"] = pd.to_numeric(df.get("mover_2h_pct", 0), errors="coerce").fillna(0.0)
     df["mover_night_pct"] = pd.to_numeric(df.get("mover_night_pct", 0), errors="coerce").fillna(0.0)
 
+    # Keep only horses that have at least one clear reason
     has_reason = (
         (df["value_edge"] > 0)
         | (df["mover_2h_pct"] <= -MIN_MOVE_PCT)
@@ -280,7 +281,20 @@ def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["rank_in_race"] = df.groupby("race_id")["signal_score"].rank(ascending=False, method="first")
+    # Prefer horses that have BOTH value and some shortening
+    df["has_shortening"] = (
+        (df["mover_2h_pct"] <= -MIN_MOVE_PCT) | (df["mover_night_pct"] <= -MIN_MOVE_PCT)
+    ).astype(int)
+    df["has_value"] = (df["value_edge"] > 0).astype(int)
+    df["priority"] = df["has_value"] + df["has_shortening"]  # 0, 1 or 2
+
+    # Rank inside each race by priority first, then signal_score
+    df["rank_in_race"] = (
+        df.groupby("race_id")
+        .apply(lambda g: g["priority"] * 1000 + g["signal_score"])
+        .reset_index(level=0, drop=True)
+        .rank(ascending=False, method="first")
+    )
     df = df[df["rank_in_race"] <= 2].copy()
 
     df["suggested_stake_units"] = 1
@@ -293,8 +307,10 @@ def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
         + "|"
         + df["runner"].astype(str)
     )
+
     return df.sort_values(
-        ["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False]
+        ["date", "course", "off_time", "priority", "signal_score"],
+        ascending=[True, True, True, False, False],
     )
 
 
@@ -421,10 +437,10 @@ def main() -> int:
     writer.write_df("MARKET_SNAPSHOTS_TARGET", snapshots_new)
     writer.append_df("MARKET_SNAPSHOTS_LOG", snapshots_new)
 
-    # ★ CRITICAL FIX: compute movers from the LOG (history), not the overwritten TARGET
+    # Compute movers from the LOG (history), not the overwritten TARGET
     snap_log = _prep_snapshots_df(writer.read_df("MARKET_SNAPSHOTS_LOG"))
 
-    # Keep only rows that belong to the current target date (reduces noise & size)
+    # Keep only rows that belong to the current target date
     if not snap_log.empty and "date" in snap_log.columns:
         snap_log = snap_log[snap_log["date"].astype(str) == target_date.isoformat()].copy()
 
