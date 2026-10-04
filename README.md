@@ -3,29 +3,45 @@
 This repo runs a Python job on a schedule (GitHub Actions) and writes UK/IRE racecards + odds + model scores into Google Sheets.
 
 ## What it does
-- Pulls today's race list + race detail from irishracing.com racecards
-- Pulls best-available price per runner from irishracing.com odds-comparison pages
-- Calculates simple model scores (form/recency/course-distance/market)
+
+- Pulls today's (or tomorrow's after 22:00 Dublin) race list + runners from irishracing.com
+- Uses Probable SP as best-available price
+- Calculates model scores + value edge
+- Tracks market movers (shortening / drifting) from historical snapshots
 - Publishes to Google Sheets tabs:
-  - TODAYS_RACES
-  - RUNNERS
-  - VALUE_BETS
-  - RUN_LOG
+  - `TARGET_DAY` – which day the job is targeting
+  - `RACES_TARGET`
+  - `RUNNERS_TARGET`
+  - `VALUE_BETS_TARGET`
+  - `MARKET_SNAPSHOTS_TARGET` / `MARKET_SNAPSHOTS_LOG`
+  - `MARKET_MOVERS_2H` / `MARKET_MOVERS`
+  - `SIGNALS`
+  - `BETS_TO_PLACE`
+  - `BET_RECS_LOG`
+  - `DASHBOARD`
+  - `RUN_LOG`
 
 ## Required GitHub Secrets
-Create these in: Repo → Settings → Secrets and variables → Actions
 
-- `GOOGLE_CREDS`  (paste the entire service-account JSON)
-- `SHEET_NAME`    (e.g. `Horse Racing Model`)
+Repo → Settings → Secrets and variables → Actions
 
-Optional:
-- `REGION`        (`gb`, `ire`, or `all`) default `all`
-- `MIN_VALUE_EDGE` (e.g. `0.03` meaning model prob - market prob >= 3%) default `0.02`
+| Secret            | Required | Example              | Notes                          |
+|-------------------|----------|----------------------|--------------------------------|
+| `GOOGLE_CREDS`    | Yes      | full service-account JSON | paste entire JSON             |
+| `SHEET_NAME`      | Yes      | `Horse Racing Model` | exact name of the spreadsheet |
+| `REGION`          | No       | `all` / `gb` / `ire` | default `all`                  |
+| `MIN_VALUE_EDGE`  | No       | `0.02`               | default `0.00`                 |
 
-## Local test (optional)
-1) Put your service-account json as `credentials.json` in repo root  
-2) `pip install -r requirements.txt`  
-3) `python horse_model.py`
+## Local test
+
+1. Put your service-account JSON as `credentials.json` in the repo root  
+   (or export `GOOGLE_CREDS` + `SHEET_NAME`)
+2. `pip install -r requirements.txt`
+3. `python horse_model.py`
 
 ## Notes / reliability
-This uses public web pages and may break if the site markup changes. If you want a **commercial-grade** setup, use a paid data feed (e.g. The Racing API). Their docs are here: https://api.theracingapi.com/documentation
+
+This uses public web pages and may break if the site markup changes.  
+For a commercial-grade feed consider [The Racing API](https://api.theracingapi.com/documentation).
+
+After the first few runs the mover tabs will start filling as snapshots accumulate.
