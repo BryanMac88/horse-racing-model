@@ -3,14 +3,30 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
-from typing import Tuple, Union
+from typing import Tuple, Union, Set
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-UA = "Mozilla/5.0 (compatible; HorseRacingSheetsBot/1.0)"
+UA = "Mozilla/5.0 (compatible; HorseRacingSheetsBot/1.1)"
 BASE = "https://www.irishracing.com"
+
+# Known Irish courses (normalised: lowercase, hyphens)
+IRE_COURSES: Set[str] = {
+    "curragh", "leopardstown", "fairyhouse", "punchestown", "navan", "cork",
+    "galway", "killarney", "listowel", "tipperary", "dundalk", "gowran-park",
+    "gowran", "naas", "roscommon", "sligo", "down-royal", "downroyal",
+    "downpatrick", "clonmel", "thurles", "limerick", "ballinrobe", "tramore",
+    "wexford", "kilbeggan", "bellewstown", "laytown", "punchestown",
+    "fairyhouse", "navan", "cork", "tipperary",
+}
+
+# Pure overseas meetings we usually want to drop even on "all"
+OVERSEAS_COURSES: Set[str] = {
+    "tokyo", "sha-tin", "kochi", "kanazawa", "ohi", "hanshin", "kyoto",
+    "nakayama", "chongqing", "seoul", "busan", "singapore", "kembla-grange",
+}
 
 
 def _clean(s: str) -> str:
@@ -38,24 +54,19 @@ def _suffix(day: int) -> str:
 
 
 def _date_label(d: date) -> str:
-    """
-    IrishRacing date label format used in URLs:
-      Wed-4th-Feb-2026
-    """
+    """IrishRacing date label format: Wed-4th-Feb-2026"""
     day = d.day
     return f"{d.strftime('%a')}-{day}{_suffix(day)}-{d.strftime('%b')}-{d.strftime('%Y')}"
 
 
 def _parse_date_input(d: Union[str, date]) -> date:
-    """
-    Accepts:
-      - YYYY-MM-DD string
-      - datetime.date
-    """
     if isinstance(d, date):
         return d
-    # string
     return datetime.strptime(str(d), "%Y-%m-%d").date()
+
+
+def _norm_course(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
 
 
 @dataclass(frozen=True)
@@ -69,50 +80,39 @@ class Race:
     going: str
     class_band: str
     race_url: str
-    race_key: str  # unique id we create: f"{course}_{off_time}_{race_name}"
+    race_key: str
 
 
 class IrishRacingClient:
-    def __init__(self, region: str = "all", timeout: int = 20) -> None:
-        self.region = region
+    def __init__(self, region: str = "all", timeout: int = 25) -> None:
+        self.region = (region or "all").lower().strip()
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": UA})
 
-    # -------------------------
-    # Public API
-    # -------------------------
     def fetch_today(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Backwards compatible: fetch races/runners for today (local machine date)."""
-        today = datetime.now().date()
-        return self.fetch_for_date(today)
+        return self.fetch_for_date(datetime.now().date())
 
     def fetch_tomorrow(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Fetch races/runners for tomorrow."""
-        tomorrow = datetime.now().date() + timedelta(days=1)
-        return self.fetch_for_date(tomorrow)
+        return self.fetch_for_date(datetime.now().date() + timedelta(days=1))
 
     def fetch_for_date(self, d: Union[str, date]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Pull racecards for a specific date (YYYY-MM-DD or date object):
-          /racecards/<DATE_LABEL>
-        Then for each meeting:
-          /racecards/<DATE_LABEL>/<COURSE>
-        We parse runners + "Probable SP" from the course page.
-        """
         target_date = _parse_date_input(d)
         date_label = _date_label(target_date)
-
         day_url = f"{BASE}/racecards/{date_label}"
 
-        html = self.session.get(day_url, timeout=self.timeout).text
+        try:
+            html = self.session.get(day_url, timeout=self.timeout).text
+        except Exception as e:
+            print(f"Failed to fetch day page {day_url}: {e}")
+            return pd.DataFrame(), pd.DataFrame()
+
         soup = BeautifulSoup(html, "lxml")
 
         meeting_links = []
         for a in soup.select("a[href^='/racecards/']"):
             href = a.get("href", "")
-            # meeting page pattern: /racecards/<date>/<course>
-            if re.fullmatch(rf"/racecards/{re.escape(date_label)}/[^/]+", href):
+            if re.fullmatch(rf"/racecards/{re.escape(date_label)}/[^/]+", href or ""):
                 meeting_links.append(href)
 
         meeting_links = list(dict.fromkeys(meeting_links))
@@ -121,9 +121,27 @@ class IrishRacingClient:
         runners_all = []
 
         for href in meeting_links:
-            course_url = BASE + href
             course = href.split("/")[-1]
-            races_df, runners_df = self._parse_course_all_races(course_url, date_label, course)
+            course_norm = _norm_course(course)
+
+            # Region filter
+            if self.region == "ire":
+                if course_norm not in IRE_COURSES:
+                    continue
+            elif self.region == "gb":
+                if course_norm in IRE_COURSES or course_norm in OVERSEAS_COURSES:
+                    continue
+            else:  # all → drop pure overseas
+                if course_norm in OVERSEAS_COURSES:
+                    continue
+
+            course_url = BASE + href
+            try:
+                races_df, runners_df = self._parse_course_all_races(course_url, date_label, course)
+            except Exception as e:
+                print(f"Failed parsing {course_url}: {e}")
+                continue
+
             if not races_df.empty:
                 races_all.append(races_df)
             if not runners_df.empty:
@@ -131,25 +149,19 @@ class IrishRacingClient:
 
         races = pd.concat(races_all, ignore_index=True) if races_all else pd.DataFrame()
         runners = pd.concat(runners_all, ignore_index=True) if runners_all else pd.DataFrame()
-
         return races, runners
 
     def enrich_with_best_prices(self, runners_df: pd.DataFrame) -> pd.DataFrame:
-        # Already populated from Probable SP on racecards
         df = runners_df.copy()
         df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
         df = df.dropna(subset=["best_price_dec"]).copy()
         return df
 
-    # -------------------------
-    # Internal parsing
-    # -------------------------
     def _parse_course_all_races(self, url: str, date_label: str, course: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
         html = self.session.get(url, timeout=self.timeout).text
         soup = BeautifulSoup(html, "lxml")
         text = soup.get_text("\n", strip=True)
 
-        # Going appears as "Going - <text>."
         going = ""
         m_going = re.search(r"Going\s*-\s*(.+?)\.", text)
         if m_going:
@@ -157,8 +169,6 @@ class IrishRacingClient:
 
         date_iso = self._label_to_date(date_label)
 
-        # Split by race time markers like "5.00", "12.28" etc.
-        # We keep blocks that contain "Probable SP -"
         blocks = re.split(r"\n(?=\d{1,2}\.\d{2}\n)", text)
 
         races_rows = []
@@ -175,13 +185,15 @@ class IrishRacingClient:
                 continue
 
             race_name = ""
-            for ln in lines[1:8]:
-                if ln.lower() in ("no", "form", "horse age weight", "trainer", "jockey", "or"):
+            for ln in lines[1:10]:
+                if ln.lower() in ("no", "form", "horse age weight", "trainer", "jockey", "or", "horse"):
                     continue
                 if re.match(r"^\d+\^\{", ln):
                     continue
-                if re.search(r"Probable SP", ln):
+                if re.search(r"Probable SP", ln, re.I):
                     break
+                if re.search(r"\b(of €|Race Conditions|Weights|Penalties)\b", ln, re.I):
+                    continue
                 race_name = ln
                 break
 
@@ -200,7 +212,7 @@ class IrishRacingClient:
                 continue
             psp = m_psp.group(1)
 
-            race_key = f"{course}_{off_time}_{re.sub(r'[^A-Za-z0-9]+','_',race_name)[:40]}"
+            race_key = f"{course}_{off_time}_{re.sub(r'[^A-Za-z0-9]+', '_', race_name)[:40]}"
 
             races_rows.append({
                 "date": date_iso,
@@ -217,7 +229,7 @@ class IrishRacingClient:
 
             horse_to_odds = {}
             for part in psp.split(","):
-                part = part.strip()
+                part = part.strip().rstrip(".")
                 m = re.match(r"(\d+/\d+)\s+(.+)$", part)
                 if not m:
                     continue
@@ -231,7 +243,11 @@ class IrishRacingClient:
                     continue
                 if ln.lower().startswith("probable sp"):
                     break
-                if re.search(r"\b(Probable|Image:|Midnite|Handicap|Maiden|Novice|H'cap|Stakes)\b", ln, re.IGNORECASE):
+                if re.search(
+                    r"\b(Probable|Image:|Midnite|Handicap|Maiden|Novice|H'cap|Stakes|Conditions|Weights|Penalties)\b",
+                    ln,
+                    re.IGNORECASE,
+                ):
                     continue
 
                 key = ln.lower()
@@ -265,11 +281,14 @@ class IrishRacingClient:
                     })
 
         races_df = pd.DataFrame(races_rows)
-        runners_df = pd.DataFrame(runner_rows).drop_duplicates(subset=["race_id", "runner"]) if runner_rows else pd.DataFrame()
+        runners_df = (
+            pd.DataFrame(runner_rows).drop_duplicates(subset=["race_id", "runner"])
+            if runner_rows
+            else pd.DataFrame()
+        )
         return races_df, runners_df
 
     def _label_to_date(self, label: str) -> str:
-        # label like Wed-4th-Feb-2026
         try:
             parts = label.split("-")
             day = re.sub(r"\D", "", parts[1])
