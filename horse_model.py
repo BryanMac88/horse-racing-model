@@ -130,7 +130,9 @@ def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
     merged["pct_change"] = (
         merged["price_30min_before"] - merged["start_price_night_before"]
     ) / merged["start_price_night_before"]
-    merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
+    merged["direction"] = merged["pct_change"].apply(
+        lambda x: "SHORTENING" if x < 0 else "DRIFTING"
+    )
     merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
     for c in ["date", "course", "off_time", "race_name"]:
         if c not in merged.columns:
@@ -152,7 +154,11 @@ def compute_persistent_shorteners(snap_df: pd.DataFrame) -> pd.DataFrame:
     last4 = d.groupby(key).tail(4).copy()
     last4["prev_price"] = last4.groupby(key)["best_price_dec"].shift(1)
     last4["down"] = (last4["best_price_dec"] < last4["prev_price"]).astype(int)
-    return last4.groupby(key, as_index=False)["down"].sum().rename(columns={"down": "shorten_steps_last4"})
+    return (
+        last4.groupby(key, as_index=False)["down"]
+        .sum()
+        .rename(columns={"down": "shorten_steps_last4"})
+    )
 
 
 def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
@@ -167,7 +173,9 @@ def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
         else pd.DataFrame(columns=["race_id", "runner", "mover_2h_pct"])
     )
     mn = (
-        movers_night[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_night_pct"})
+        movers_night[["race_id", "runner", "pct_change"]].rename(
+            columns={"pct_change": "mover_night_pct"}
+        )
         if movers_night is not None and not movers_night.empty
         else pd.DataFrame(columns=["race_id", "runner", "mover_night_pct"])
     )
@@ -189,7 +197,9 @@ def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
     )
     out["mover_2h_pct"] = pd.to_numeric(out.get("mover_2h_pct", 0), errors="coerce").fillna(0.0)
     out["mover_night_pct"] = pd.to_numeric(out.get("mover_night_pct", 0), errors="coerce").fillna(0.0)
-    out["shorten_steps_last4"] = pd.to_numeric(out.get("shorten_steps_last4", 0), errors="coerce").fillna(0).astype(int)
+    out["shorten_steps_last4"] = (
+        pd.to_numeric(out.get("shorten_steps_last4", 0), errors="coerce").fillna(0).astype(int)
+    )
     out["shorten_2h_score"] = (-out["mover_2h_pct"]).clip(lower=0)
     out["shorten_night_score"] = (-out["mover_night_pct"]).clip(lower=0)
     out["signal_score"] = (
@@ -198,7 +208,13 @@ def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
         + 1.2 * out["shorten_night_score"]
         + 0.15 * out["shorten_steps_last4"]
     )
-    return out.sort_values(["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False])
+    # % display helpers
+    out["value_edge_pct"] = (out["value_edge"] * 100).round(1)
+    out["mover_2h_display_pct"] = (out["mover_2h_pct"] * 100).round(1)
+    out["mover_night_display_pct"] = (out["mover_night_pct"] * 100).round(1)
+    return out.sort_values(
+        ["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False]
+    )
 
 
 def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
@@ -234,9 +250,16 @@ def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
     df = df[df["rank_in_race"] <= 2].copy()
     df["suggested_stake_units"] = 1
     df["bet_key"] = (
-        df["date"].astype(str) + "|" + df["course"].astype(str) + "|"
-        + df["off_time"].astype(str) + "|" + df["runner"].astype(str)
+        df["date"].astype(str)
+        + "|"
+        + df["course"].astype(str)
+        + "|"
+        + df["off_time"].astype(str)
+        + "|"
+        + df["runner"].astype(str)
     )
+    if "value_edge_pct" not in df.columns:
+        df["value_edge_pct"] = (df["value_edge"] * 100).round(1)
     return df.sort_values(
         ["date", "course", "off_time", "priority", "signal_score"],
         ascending=[True, True, True, False, False],
@@ -260,7 +283,7 @@ def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> No
     out["bet_key"] = new_rows["bet_key"]
     for c in [
         "date", "course", "off_time", "race_name", "runner", "best_price_dec",
-        "signal_score", "value_edge", "mover_2h_pct", "mover_night_pct",
+        "signal_score", "value_edge", "value_edge_pct", "mover_2h_pct", "mover_night_pct",
         "shorten_steps_last4", "suggested_stake_units",
     ]:
         out[c] = new_rows.get(c, "")
@@ -269,21 +292,42 @@ def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> No
     out["notes"] = ""
     cols = [
         "timestamp_utc", "bet_key", "date", "course", "off_time", "race_name", "runner",
-        "best_price_dec", "signal_score", "value_edge", "mover_2h_pct", "mover_night_pct",
-        "shorten_steps_last4", "suggested_stake_units", "result", "pnl_units", "notes",
+        "best_price_dec", "signal_score", "value_edge", "value_edge_pct",
+        "mover_2h_pct", "mover_night_pct", "shorten_steps_last4",
+        "suggested_stake_units", "result", "pnl_units", "notes",
     ]
     writer.append_df("BET_RECS_LOG", out[cols])
 
 
 def build_dashboard(races, runners, movers2h, moversnight, bets) -> pd.DataFrame:
     return pd.DataFrame([
-        {"metric": "last_run_local", "value": datetime.now(timezone.utc).astimezone(TZ).isoformat(timespec="seconds")},
+        {
+            "metric": "last_run_local",
+            "value": datetime.now(timezone.utc).astimezone(TZ).isoformat(timespec="seconds"),
+        },
         {"metric": "races_target_day", "value": int(len(races)) if races is not None else 0},
         {"metric": "runners_target_day", "value": int(len(runners)) if runners is not None else 0},
         {"metric": "movers_2h_rows", "value": int(len(movers2h)) if movers2h is not None else 0},
-        {"metric": "movers_night_rows", "value": int(len(moversnight)) if moversnight is not None else 0},
+        {
+            "metric": "movers_night_rows",
+            "value": int(len(moversnight)) if moversnight is not None else 0,
+        },
         {"metric": "bets_to_place", "value": int(len(bets)) if bets is not None else 0},
     ])
+
+
+def _order_runner_cols(df: pd.DataFrame) -> pd.DataFrame:
+    preferred = [
+        "date", "course", "off_time", "runner", "best_price_dec",
+        "market_prob_pct", "model_prob_pct", "value_edge_pct",
+        "recent_form_pct", "days_since", "form_string", "form_runs",
+        "going", "going_fit_pct", "wins_last5", "places_last5",
+        "race_name", "race_id", "horse_url",
+    ]
+    cols = [c for c in preferred if c in df.columns] + [
+        c for c in df.columns if c not in preferred
+    ]
+    return df[cols]
 
 
 def main() -> int:
@@ -306,8 +350,6 @@ def main() -> int:
         return 0
 
     runners_df = client.enrich_with_best_prices(runners_df)
-
-    # Phase 1 form
     runners_df = client.enrich_with_form(
         runners_df,
         max_horses=80,
@@ -320,19 +362,22 @@ def main() -> int:
 
     writer = SheetsWriter(sheet_name=sheet_name, credentials_path="credentials.json")
 
-    writer.write_df("TARGET_DAY", pd.DataFrame([{
-        "run_utc": now_utc.isoformat(timespec="seconds"),
-        "run_local_dublin": now_local.isoformat(timespec="seconds"),
-        "dublin_hour": int(now_local.hour),
-        "after_22_rule": bool(after_cutoff),
-        "target_label": target_label,
-        "target_date": target_date.isoformat(),
-        "night_before_hour_local": NIGHT_BEFORE_HOUR,
-        "region": region,
-    }]))
+    writer.write_df(
+        "TARGET_DAY",
+        pd.DataFrame([{
+            "run_utc": now_utc.isoformat(timespec="seconds"),
+            "run_local_dublin": now_local.isoformat(timespec="seconds"),
+            "dublin_hour": int(now_local.hour),
+            "after_22_rule": bool(after_cutoff),
+            "target_label": target_label,
+            "target_date": target_date.isoformat(),
+            "night_before_hour_local": NIGHT_BEFORE_HOUR,
+            "region": region,
+        }]),
+    )
 
     writer.write_df("RACES_TARGET", races_df)
-    writer.write_df("RUNNERS_TARGET", scored)
+    writer.write_df("RUNNERS_TARGET", _order_runner_cols(scored))
     writer.write_df("VALUE_BETS_TARGET", value_bets)
 
     snapshots_new = scored[
@@ -364,18 +409,21 @@ def main() -> int:
     dashboard = build_dashboard(races_df, scored, movers_2h, movers_night, bets_to_place)
     writer.write_df("DASHBOARD", dashboard)
 
-    writer.write_df("RUN_LOG", pd.DataFrame([{
-        "run_utc": now_utc.isoformat(timespec="seconds"),
-        "run_local_dublin": now_local.isoformat(timespec="seconds"),
-        "region": region,
-        "target_label": target_label,
-        "target_date": target_date.isoformat(),
-        "races": int(len(races_df)),
-        "runners": int(len(scored)),
-        "movers_2h": int(len(movers_2h)),
-        "movers_night": int(len(movers_night)),
-        "bets": int(len(bets_to_place)),
-    }]))
+    writer.write_df(
+        "RUN_LOG",
+        pd.DataFrame([{
+            "run_utc": now_utc.isoformat(timespec="seconds"),
+            "run_local_dublin": now_local.isoformat(timespec="seconds"),
+            "region": region,
+            "target_label": target_label,
+            "target_date": target_date.isoformat(),
+            "races": int(len(races_df)),
+            "runners": int(len(scored)),
+            "movers_2h": int(len(movers_2h)),
+            "movers_night": int(len(movers_night)),
+            "bets": int(len(bets_to_place)),
+        }]),
+    )
 
     print(
         f"Update complete. target={target_label} {target_date} | "
