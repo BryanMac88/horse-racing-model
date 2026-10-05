@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 
 from src.sources.irishracing import IrishRacingClient
@@ -165,7 +166,14 @@ def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
     df = scored.copy()
     df["runner_count"] = pd.to_numeric(df.get("runner_count", 0), errors="coerce").fillna(0)
     df = df[df["runner_count"] <= MAX_RUNNERS_FOR_SIGNAL].copy()
+
     df["value_edge"] = pd.to_numeric(df.get("value_edge", 0), errors="coerce").fillna(0.0)
+    df["win_score"] = pd.to_numeric(df.get("win_score", 0), errors="coerce").fillna(0.0)
+    df["is_favorite"] = pd.to_numeric(df.get("is_favorite", 0), errors="coerce").fillna(0).astype(int)
+    df["form_supports_fav"] = pd.to_numeric(
+        df.get("form_supports_fav", 0), errors="coerce"
+    ).fillna(0).astype(int)
+    df["form_quality"] = pd.to_numeric(df.get("form_quality", 0), errors="coerce").fillna(0.0)
 
     m2 = (
         movers_2h[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": "mover_2h_pct"})
@@ -188,6 +196,7 @@ def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
         if not t.empty:
             t["race_id"] = t["race_id"].astype(str).str.strip()
             t["runner"] = t["runner"].astype(str).str.strip()
+
     df["race_id"] = df["race_id"].astype(str).str.strip()
     df["runner"] = df["runner"].astype(str).str.strip()
     out = (
@@ -200,68 +209,108 @@ def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
     out["shorten_steps_last4"] = (
         pd.to_numeric(out.get("shorten_steps_last4", 0), errors="coerce").fillna(0).astype(int)
     )
-    out["shorten_2h_score"] = (-out["mover_2h_pct"]).clip(lower=0)
-    out["shorten_night_score"] = (-out["mover_night_pct"]).clip(lower=0)
-    out["signal_score"] = (
-        1.0 * out["value_edge"].clip(lower=0)
-        + 0.8 * out["shorten_2h_score"]
-        + 1.2 * out["shorten_night_score"]
-        + 0.15 * out["shorten_steps_last4"]
+
+    out["shorten_boost"] = (
+        0.15 * (-out["mover_2h_pct"]).clip(lower=0)
+        + 0.20 * (-out["mover_night_pct"]).clip(lower=0)
+        + 0.05 * out["shorten_steps_last4"].clip(0, 3)
     )
-    # % display helpers
+
+    out["signal_score"] = (
+        1.00 * out["win_score"]
+        + 0.25 * out["form_quality"]
+        + 0.15 * out["is_favorite"]
+        + 0.20 * out["form_supports_fav"]
+        + out["shorten_boost"]
+        + 0.10 * out["value_edge"].clip(lower=0)
+    )
+
     out["value_edge_pct"] = (out["value_edge"] * 100).round(1)
+    out["win_score_pct"] = (out["win_score"] * 100).round(1)
     out["mover_2h_display_pct"] = (out["mover_2h_pct"] * 100).round(1)
     out["mover_night_display_pct"] = (out["mover_night_pct"] * 100).round(1)
+
     return out.sort_values(
-        ["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False]
+        ["date", "course", "off_time", "signal_score"],
+        ascending=[True, True, True, False],
     )
 
 
 def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
     if signals is None or signals.empty:
         return pd.DataFrame()
+
     df = signals.copy()
     df["signal_score"] = pd.to_numeric(df.get("signal_score", 0), errors="coerce").fillna(0.0)
+    df["win_score"] = pd.to_numeric(df.get("win_score", 0), errors="coerce").fillna(0.0)
     df["value_edge"] = pd.to_numeric(df.get("value_edge", 0), errors="coerce").fillna(0.0)
+    df["is_favorite"] = pd.to_numeric(df.get("is_favorite", 0), errors="coerce").fillna(0).astype(int)
+    df["form_supports_fav"] = pd.to_numeric(
+        df.get("form_supports_fav", 0), errors="coerce"
+    ).fillna(0).astype(int)
+    df["form_quality"] = pd.to_numeric(df.get("form_quality", 0), errors="coerce").fillna(0.0)
     df["mover_2h_pct"] = pd.to_numeric(df.get("mover_2h_pct", 0), errors="coerce").fillna(0.0)
     df["mover_night_pct"] = pd.to_numeric(df.get("mover_night_pct", 0), errors="coerce").fillna(0.0)
 
-    has_reason = (
-        (df["value_edge"] > 0)
-        | (df["mover_2h_pct"] <= -MIN_MOVE_PCT)
-        | (df["mover_night_pct"] <= -MIN_MOVE_PCT)
+    weak = (
+        (df["win_score"] < 0.08)
+        & (df["is_favorite"] == 0)
+        & (df["form_quality"] < 0.25)
+        & (df["mover_2h_pct"] > -MIN_MOVE_PCT)
+        & (df["mover_night_pct"] > -MIN_MOVE_PCT)
     )
-    df = df[has_reason].copy()
+    df = df[~weak].copy()
     if df.empty:
         return df
 
-    df["has_shortening"] = (
-        (df["mover_2h_pct"] <= -MIN_MOVE_PCT) | (df["mover_night_pct"] <= -MIN_MOVE_PCT)
-    ).astype(int)
-    df["has_value"] = (df["value_edge"] > 0).astype(int)
-    df["priority"] = df["has_value"] + df["has_shortening"]
+    df["pick_tier"] = 1
+    df.loc[df["form_supports_fav"] == 1, "pick_tier"] = 3
+    solid = (
+        (df["form_quality"] >= 0.40)
+        | (df["win_score"] >= 0.22)
+        | (df["mover_2h_pct"] <= -MIN_MOVE_PCT)
+        | (df["mover_night_pct"] <= -MIN_MOVE_PCT)
+    )
+    df.loc[(df["pick_tier"] < 3) & solid, "pick_tier"] = 2
 
-    df["rank_in_race"] = (
-        df.groupby("race_id")
-        .apply(lambda g: g["priority"] * 1000 + g["signal_score"])
-        .reset_index(level=0, drop=True)
-        .rank(ascending=False, method="first")
+    df["rank_key"] = df["pick_tier"] * 10.0 + df["signal_score"]
+    df["rank_in_race"] = df.groupby("race_id")["rank_key"].rank(ascending=False, method="first")
+
+    primary = df[df["rank_in_race"] == 1].copy()
+    primary["pick_role"] = "PRIMARY_WINNER"
+    primary["suggested_stake_units"] = np.where(primary["pick_tier"] >= 2, 1.0, 0.5)
+
+    second = df[df["rank_in_race"] == 2].copy()
+    if not second.empty and not primary.empty:
+        merged = second.merge(
+            primary[["race_id", "signal_score"]].rename(columns={"signal_score": "primary_score"}),
+            on="race_id",
+            how="left",
+        )
+        keep_second = merged["signal_score"] >= (merged["primary_score"] * 0.85)
+        second = merged[keep_second].copy()
+        second["pick_role"] = "SECONDARY"
+        second["suggested_stake_units"] = 0.5
+        out = pd.concat([primary, second], ignore_index=True)
+    else:
+        out = primary
+
+    out["bet_key"] = (
+        out["date"].astype(str)
+        + "|"
+        + out["course"].astype(str)
+        + "|"
+        + out["off_time"].astype(str)
+        + "|"
+        + out["runner"].astype(str)
     )
-    df = df[df["rank_in_race"] <= 2].copy()
-    df["suggested_stake_units"] = 1
-    df["bet_key"] = (
-        df["date"].astype(str)
-        + "|"
-        + df["course"].astype(str)
-        + "|"
-        + df["off_time"].astype(str)
-        + "|"
-        + df["runner"].astype(str)
-    )
-    if "value_edge_pct" not in df.columns:
-        df["value_edge_pct"] = (df["value_edge"] * 100).round(1)
-    return df.sort_values(
-        ["date", "course", "off_time", "priority", "signal_score"],
+    if "value_edge_pct" not in out.columns:
+        out["value_edge_pct"] = (out["value_edge"] * 100).round(1)
+    if "win_score_pct" not in out.columns:
+        out["win_score_pct"] = (out["win_score"] * 100).round(1)
+
+    return out.sort_values(
+        ["date", "course", "off_time", "pick_tier", "signal_score"],
         ascending=[True, True, True, False, False],
     )
 
@@ -283,19 +332,16 @@ def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> No
     out["bet_key"] = new_rows["bet_key"]
     for c in [
         "date", "course", "off_time", "race_name", "runner", "best_price_dec",
-        "signal_score", "value_edge", "value_edge_pct", "mover_2h_pct", "mover_night_pct",
-        "shorten_steps_last4", "suggested_stake_units",
+        "signal_score", "win_score", "value_edge", "value_edge_pct",
+        "is_favorite", "form_supports_fav", "pick_role",
+        "mover_2h_pct", "mover_night_pct", "shorten_steps_last4",
+        "suggested_stake_units",
     ]:
         out[c] = new_rows.get(c, "")
     out["result"] = ""
     out["pnl_units"] = ""
     out["notes"] = ""
-    cols = [
-        "timestamp_utc", "bet_key", "date", "course", "off_time", "race_name", "runner",
-        "best_price_dec", "signal_score", "value_edge", "value_edge_pct",
-        "mover_2h_pct", "mover_night_pct", "shorten_steps_last4",
-        "suggested_stake_units", "result", "pnl_units", "notes",
-    ]
+    cols = list(out.columns)
     writer.append_df("BET_RECS_LOG", out[cols])
 
 
@@ -319,10 +365,11 @@ def build_dashboard(races, runners, movers2h, moversnight, bets) -> pd.DataFrame
 def _order_runner_cols(df: pd.DataFrame) -> pd.DataFrame:
     preferred = [
         "date", "course", "off_time", "runner", "best_price_dec",
-        "market_prob_pct", "model_prob_pct", "value_edge_pct",
+        "is_favorite", "win_score_pct", "market_prob_pct", "model_prob_pct",
+        "value_edge_pct", "form_quality_pct", "form_supports_fav",
         "recent_form_pct", "days_since", "form_string", "form_runs",
         "going", "going_fit_pct", "wins_last5", "places_last5",
-        "race_name", "race_id", "horse_url",
+        "race_name", "race_id",
     ]
     cols = [c for c in preferred if c in df.columns] + [
         c for c in df.columns if c not in preferred
