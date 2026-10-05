@@ -1,28 +1,26 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
-from typing import Tuple, Union, Set
+from typing import Dict, List, Optional, Tuple, Union, Set
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-UA = "Mozilla/5.0 (compatible; HorseRacingSheetsBot/1.1)"
+UA = "Mozilla/5.0 (compatible; HorseRacingSheetsBot/1.2)"
 BASE = "https://www.irishracing.com"
 
-# Known Irish courses (normalised: lowercase, hyphens)
 IRE_COURSES: Set[str] = {
     "curragh", "leopardstown", "fairyhouse", "punchestown", "navan", "cork",
     "galway", "killarney", "listowel", "tipperary", "dundalk", "gowran-park",
     "gowran", "naas", "roscommon", "sligo", "down-royal", "downroyal",
     "downpatrick", "clonmel", "thurles", "limerick", "ballinrobe", "tramore",
-    "wexford", "kilbeggan", "bellewstown", "laytown", "punchestown",
-    "fairyhouse", "navan", "cork", "tipperary",
+    "wexford", "kilbeggan", "bellewstown", "laytown",
 }
 
-# Pure overseas meetings we usually want to drop even on "all"
 OVERSEAS_COURSES: Set[str] = {
     "tokyo", "sha-tin", "kochi", "kanazawa", "ohi", "hanshin", "kyoto",
     "nakayama", "chongqing", "seoul", "busan", "singapore", "kembla-grange",
@@ -54,7 +52,6 @@ def _suffix(day: int) -> str:
 
 
 def _date_label(d: date) -> str:
-    """IrishRacing date label format: Wed-4th-Feb-2026"""
     day = d.day
     return f"{d.strftime('%a')}-{day}{_suffix(day)}-{d.strftime('%b')}-{d.strftime('%Y')}"
 
@@ -69,18 +66,34 @@ def _norm_course(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
 
 
+def _parse_form_date(s: str) -> Optional[date]:
+    s = (s or "").strip()
+    for fmt in ("%d%b%y", "%d%b%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _pos_score(pos: Optional[int], field: Optional[int]) -> float:
+    if pos is None or pos <= 0:
+        return 0.0
+    if field and field > 1:
+        return max(0.0, 1.0 - (pos - 1) / max(field - 1, 1))
+    return max(0.0, 1.0 - (pos - 1) / 12.0)
+
+
 @dataclass(frozen=True)
-class Race:
-    date: str
-    date_label: str
-    course: str
-    off_time: str
-    race_name: str
+class FormRun:
+    run_date: Optional[date]
+    course_code: str
     distance: str
     going: str
-    class_band: str
-    race_url: str
-    race_key: str
+    position: Optional[int]
+    field_size: Optional[int]
+    sp_frac: str
+    raw: str
 
 
 class IrishRacingClient:
@@ -108,30 +121,25 @@ class IrishRacingClient:
             return pd.DataFrame(), pd.DataFrame()
 
         soup = BeautifulSoup(html, "lxml")
-
         meeting_links = []
         for a in soup.select("a[href^='/racecards/']"):
             href = a.get("href", "")
             if re.fullmatch(rf"/racecards/{re.escape(date_label)}/[^/]+", href or ""):
                 meeting_links.append(href)
-
         meeting_links = list(dict.fromkeys(meeting_links))
 
-        races_all = []
-        runners_all = []
-
+        races_all, runners_all = [], []
         for href in meeting_links:
             course = href.split("/")[-1]
             course_norm = _norm_course(course)
 
-            # Region filter
             if self.region == "ire":
                 if course_norm not in IRE_COURSES:
                     continue
             elif self.region == "gb":
                 if course_norm in IRE_COURSES or course_norm in OVERSEAS_COURSES:
                     continue
-            else:  # all → drop pure overseas
+            else:
                 if course_norm in OVERSEAS_COURSES:
                     continue
 
@@ -157,10 +165,68 @@ class IrishRacingClient:
         df = df.dropna(subset=["best_price_dec"]).copy()
         return df
 
-    def _parse_course_all_races(self, url: str, date_label: str, course: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def enrich_with_form(
+        self,
+        runners_df: pd.DataFrame,
+        max_horses: int = 80,
+        max_workers: int = 8,
+        max_runs: int = 8,
+    ) -> pd.DataFrame:
+        if runners_df is None or runners_df.empty:
+            return runners_df
+
+        df = runners_df.copy()
+        if "horse_url" not in df.columns:
+            df["horse_url"] = ""
+
+        work = df[df["horse_url"].astype(str).str.len() > 5].copy()
+        if work.empty:
+            print("No horse_url values – form enrichment skipped.")
+            return self._attach_empty_form_features(df)
+
+        work["best_price_dec"] = pd.to_numeric(work["best_price_dec"], errors="coerce")
+        work = work.sort_values("best_price_dec", ascending=True)
+        unique = work.drop_duplicates(subset=["horse_url"]).head(max_horses)
+        urls = unique["horse_url"].tolist()
+        print(f"Fetching form for {len(urls)} horses (max_workers={max_workers})...")
+
+        form_by_url: Dict[str, dict] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = {ex.submit(self._fetch_horse_form_features, u, max_runs): u for u in urls}
+            for fut in as_completed(futs):
+                u = futs[fut]
+                try:
+                    form_by_url[u] = fut.result()
+                except Exception as e:
+                    form_by_url[u] = self._empty_form_features()
+                    print(f"  form fail {u}: {e}")
+
+        feature_cols = list(self._empty_form_features().keys())
+        for col in feature_cols:
+            default = self._empty_form_features()[col]
+            df[col] = df["horse_url"].map(
+                lambda u, c=col, d=default: form_by_url.get(u, {}).get(c, d)
+            )
+
+        n_ok = sum(1 for v in form_by_url.values() if v.get("form_runs", 0) > 0)
+        print(f"Form enrichment done: {n_ok}/{len(urls)} horses with runs.")
+        return df
+
+    def _parse_course_all_races(
+        self, url: str, date_label: str, course: str
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         html = self.session.get(url, timeout=self.timeout).text
         soup = BeautifulSoup(html, "lxml")
         text = soup.get_text("\n", strip=True)
+
+        horse_url_map: Dict[str, str] = {}
+        for a in soup.select("a[href*='/horse/']"):
+            href = a.get("href", "")
+            name = _clean(a.get_text(" ", strip=True)).lower()
+            if name and href:
+                if href.startswith("/"):
+                    href = BASE + href
+                horse_url_map[name] = href
 
         going = ""
         m_going = re.search(r"Going\s*-\s*(.+?)\.", text)
@@ -168,27 +234,24 @@ class IrishRacingClient:
             going = _clean(m_going.group(1))
 
         date_iso = self._label_to_date(date_label)
-
         blocks = re.split(r"\n(?=\d{1,2}\.\d{2}\n)", text)
 
-        races_rows = []
-        runner_rows = []
+        races_rows, runner_rows = [], []
 
         for block in blocks:
             m_time = re.match(r"(\d{1,2}\.\d{2})\n", block)
             if not m_time:
                 continue
             off_time = m_time.group(1)
-
             lines = [ln.strip() for ln in block.split("\n") if ln.strip()]
             if len(lines) < 3:
                 continue
 
             race_name = ""
             for ln in lines[1:10]:
-                if ln.lower() in ("no", "form", "horse age weight", "trainer", "jockey", "or", "horse"):
-                    continue
-                if re.match(r"^\d+\^\{", ln):
+                if ln.lower() in (
+                    "no", "form", "horse age weight", "trainer", "jockey", "or", "horse"
+                ):
                     continue
                 if re.search(r"Probable SP", ln, re.I):
                     break
@@ -198,7 +261,9 @@ class IrishRacingClient:
                 break
 
             dist = ""
-            m_dist = re.search(r"(\d+m\.\s*\d+f\.\s*\d+yds\.|\d+m\.\s*\d+f\.|\d+f\.)", block)
+            m_dist = re.search(
+                r"(\d+m\.\s*\d+f\.\s*\d+yds\.|\d+m\.\s*\d+f\.|\d+f\.)", block
+            )
             if m_dist:
                 dist = _clean(m_dist.group(1)).replace(" .", ".")
 
@@ -212,7 +277,9 @@ class IrishRacingClient:
                 continue
             psp = m_psp.group(1)
 
-            race_key = f"{course}_{off_time}_{re.sub(r'[^A-Za-z0-9]+', '_', race_name)[:40]}"
+            race_key = (
+                f"{course}_{off_time}_{re.sub(r'[^A-Za-z0-9]+', '_', race_name)[:40]}"
+            )
 
             races_rows.append({
                 "date": date_iso,
@@ -227,7 +294,7 @@ class IrishRacingClient:
                 "race_id": race_key,
             })
 
-            horse_to_odds = {}
+            horse_to_odds: Dict[str, str] = {}
             for part in psp.split(","):
                 part = part.strip().rstrip(".")
                 m = re.match(r"(\d+/\d+)\s+(.+)$", part)
@@ -246,55 +313,41 @@ class IrishRacingClient:
                 if re.search(
                     r"\b(Probable|Image:|Midnite|Handicap|Maiden|Novice|H'cap|Stakes|Conditions|Weights|Penalties)\b",
                     ln,
-                    re.IGNORECASE,
+                    re.I,
                 ):
                     continue
 
                 key = ln.lower()
-                if key in horse_to_odds:
-                    frac = horse_to_odds[key]
-                    dec = _frac_to_decimal(frac)
-                    if not dec:
-                        continue
-                    runner_rows.append({
-                        "date": date_iso,
-                        "date_label": date_label,
-                        "course": course,
-                        "off_time": off_time,
-                        "race_name": race_name,
-                        "distance": dist,
-                        "going": going,
-                        "class_band": class_band,
-                        "race_id": race_key,
-                        "runner": ln,
-                        "best_price_frac": frac,
-                        "best_price_dec": float(dec),
-                        "rating": "",
-                        "days_since": 60,
-                        "course_distance": "",
-                        "trainer": "",
-                        "jockey": "",
-                        "weight": "",
-                        "age": "",
-                        "sex": "",
-                        "draw": "",
-                    })
+                if key not in horse_to_odds:
+                    continue
+                frac = horse_to_odds[key]
+                dec = _frac_to_decimal(frac)
+                if not dec:
+                    continue
 
-        races_df = pd.DataFrame(races_rows)
-        runners_df = (
-            pd.DataFrame(runner_rows).drop_duplicates(subset=["race_id", "runner"])
-            if runner_rows
-            else pd.DataFrame()
-        )
-        return races_df, runners_df
+                horse_url = horse_url_map.get(key, "")
+                if not horse_url:
+                    for n, u in horse_url_map.items():
+                        if n in key or key in n:
+                            horse_url = u
+                            break
 
-    def _label_to_date(self, label: str) -> str:
-        try:
-            parts = label.split("-")
-            day = re.sub(r"\D", "", parts[1])
-            mon = parts[2]
-            year = parts[3]
-            dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
-            return dt.date().isoformat()
-        except Exception:
-            return datetime.utcnow().date().isoformat()
+                runner_rows.append({
+                    "date": date_iso,
+                    "date_label": date_label,
+                    "course": course,
+                    "off_time": off_time,
+                    "race_name": race_name,
+                    "distance": dist,
+                    "going": going,
+                    "class_band": class_band,
+                    "race_id": race_key,
+                    "runner": ln,
+                    "horse_url": horse_url,
+                    "best_price_frac": frac,
+                    "best_price_dec": float(dec),
+                    "rating": "",
+                    "days_since": 60,
+                    "course_distance": "",
+                    "trainer": "",
+                    "jockey": "",
