@@ -477,19 +477,11 @@ class IrishRacingClient:
         soft_runs = [r for r in runs if any(k in r.going.lower() for k in soft_keys)]
         good_runs = [r for r in runs if any(k in r.going.lower() for k in good_keys)]
         if soft_runs:
-            feats["soft_win_rate"] = sum(1 for r in soft_runs if is_win(r)) / len(
-                soft_runs
-            )
-            feats["soft_place_rate"] = sum(1 for r in soft_runs if is_place(r)) / len(
-                soft_runs
-            )
+            feats["soft_win_rate"] = sum(1 for r in soft_runs if is_win(r)) / len(soft_runs)
+            feats["soft_place_rate"] = sum(1 for r in soft_runs if is_place(r)) / len(soft_runs)
         if good_runs:
-            feats["good_win_rate"] = sum(1 for r in good_runs if is_win(r)) / len(
-                good_runs
-            )
-            feats["good_place_rate"] = sum(1 for r in good_runs if is_place(r)) / len(
-                good_runs
-            )
+            feats["good_win_rate"] = sum(1 for r in good_runs if is_win(r)) / len(good_runs)
+            feats["good_place_rate"] = sum(1 for r in good_runs if is_place(r)) / len(good_runs)
 
         feats["course_runs"] = len(runs)
         feats["course_wins"] = sum(1 for r in runs if is_win(r))
