@@ -21,11 +21,17 @@ def build_runner_scores(runners: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
+    # --- Market (betting) ---
     df["market_prob_raw"] = 1.0 / df["best_price_dec"]
     df["market_prob"] = df.groupby("race_id")["market_prob_raw"].transform(
         lambda s: s / max(1e-9, s.sum())
     )
+    # Favorite = highest market_prob in race
+    df["is_favorite"] = (
+        df.groupby("race_id")["market_prob"].rank(ascending=False, method="first") == 1
+    ).astype(int)
 
+    # --- Form / history ---
     df["days_since"] = pd.to_numeric(df.get("days_since", 60), errors="coerce").fillna(60).clip(0, 365)
     df["recency"] = 1.0 - (df["days_since"].clip(0, 60) / 60.0)
 
@@ -39,8 +45,6 @@ def build_runner_scores(runners: pd.DataFrame) -> pd.DataFrame:
 
     df["soft_place_rate"] = pd.to_numeric(df.get("soft_place_rate", 0), errors="coerce").fillna(0)
     df["good_place_rate"] = pd.to_numeric(df.get("good_place_rate", 0), errors="coerce").fillna(0)
-    df["soft_win_rate"] = pd.to_numeric(df.get("soft_win_rate", 0), errors="coerce").fillna(0)
-    df["good_win_rate"] = pd.to_numeric(df.get("good_win_rate", 0), errors="coerce").fillna(0)
 
     race_going = df.get("going", pd.Series([""] * len(df))).astype(str)
     df["going_bucket"] = race_going.map(_going_bucket)
@@ -63,48 +67,87 @@ def build_runner_scores(runners: pd.DataFrame) -> pd.DataFrame:
     df["runner_count"] = df.groupby("race_id")["runner"].transform("count")
     df["field_factor"] = (1.0 / df["runner_count"].clip(lower=4)).clip(0.05, 0.25)
 
-    cd_raw = df.get("course_distance", "")
-    if not isinstance(cd_raw, pd.Series):
-        df["cd"] = 0
-    else:
-        df["cd"] = cd_raw.astype(str).str.contains("cd", case=False, na=False).astype(int)
-
     df["place_rate_last5"] = (df["places_last5"] / 5.0).clip(0, 1)
     df["win_rate_last5"] = (df["wins_last5"] / 5.0).clip(0, 1)
     df["pos_score"] = (1.0 - ((df["avg_pos_last3"] - 1.0) / 10.0)).clip(0, 1)
 
-    df["score_raw"] = (
-        0.28 * df["recent_form_score"]
-        + 0.18 * df["place_rate_last5"]
-        + 0.12 * df["win_rate_last5"]
-        + 0.12 * df["going_fit"]
+    # Form quality 0–1 (history)
+    df["form_quality"] = (
+        0.40 * df["recent_form_score"]
+        + 0.25 * df["place_rate_last5"]
+        + 0.15 * df["win_rate_last5"]
+        + 0.10 * df["going_fit"]
         + 0.10 * df["recency"]
-        + 0.08 * df["pos_score"]
-        + 0.07 * df["rating_norm"]
-        + 0.05 * df["field_factor"]
     ).clip(0, 1)
 
+    # When we have no form, lean on market only
     has_form = df["form_runs"] > 0
-    df["form_weight"] = np.where(has_form, 0.55, 0.20)
+    df["form_quality"] = np.where(has_form, df["form_quality"], df["market_prob"])
+
+    # --- WIN SCORE: most likely winner (form + betting + history) ---
+    # Favorite with solid form should score highly.
+    df["win_score_raw"] = (
+        0.45 * df["market_prob"]       # betting / public
+        + 0.35 * df["form_quality"]    # form + history
+        + 0.10 * df["going_fit"]
+        + 0.05 * df["recency"]
+        + 0.05 * df["field_factor"]
+    ).clip(1e-6, 1.0)
+
+    # Small boost if favorite AND form is not weak
+    form_ok = (df["form_quality"] >= 0.35) | (df["places_last5"] >= 2) | (~has_form)
+    df["win_score_raw"] = np.where(
+        (df["is_favorite"] == 1) & form_ok,
+        df["win_score_raw"] * 1.08,
+        df["win_score_raw"],
+    )
+
+    df["win_score"] = df.groupby("race_id")["win_score_raw"].transform(
+        lambda s: s / max(1e-9, s.sum())
+    )
+
+    # Model prob stays form-leaning for value calc
+    df["score_raw"] = (
+        0.30 * df["form_quality"]
+        + 0.25 * df["recent_form_score"]
+        + 0.15 * df["place_rate_last5"]
+        + 0.10 * df["going_fit"]
+        + 0.10 * df["recency"]
+        + 0.05 * df["pos_score"]
+        + 0.05 * df["rating_norm"]
+    ).clip(0, 1)
+    df["form_weight"] = np.where(has_form, 0.60, 0.25)
     df["score_blended"] = (
         df["form_weight"] * df["score_raw"] + (1.0 - df["form_weight"]) * df["market_prob"]
     ).clip(1e-6, 1.0)
-
     df["model_prob"] = df.groupby("race_id")["score_blended"].transform(
         lambda s: s / max(1e-9, s.sum())
     )
     df["value_edge"] = df["model_prob"] - df["market_prob"]
-    df["confidence"] = (df["score_blended"] * 100).round(1)
+    df["confidence"] = (df["win_score"] * 100).round(1)
 
-    # % columns for Sheets readability
+    # Form supports favorite?
+    df["form_supports_fav"] = (
+        (df["is_favorite"] == 1)
+        & (
+            (df["form_quality"] >= 0.40)
+            | (df["places_last5"] >= 2)
+            | (df["wins_last5"] >= 1)
+            | (df["form_runs"] == 0)  # no form: trust market favorite
+        )
+    ).astype(int)
+
+    # % display
     df["market_prob_pct"] = (df["market_prob"] * 100).round(1)
     df["model_prob_pct"] = (df["model_prob"] * 100).round(1)
+    df["win_score_pct"] = (df["win_score"] * 100).round(1)
     df["value_edge_pct"] = (df["value_edge"] * 100).round(1)
     df["recent_form_pct"] = (df["recent_form_score"] * 100).round(1)
+    df["form_quality_pct"] = (df["form_quality"] * 100).round(1)
     df["going_fit_pct"] = (df["going_fit"] * 100).round(1)
 
     return df.sort_values(
-        ["date", "course", "off_time", "value_edge"],
+        ["date", "course", "off_time", "win_score"],
         ascending=[True, True, True, False],
     )
 
