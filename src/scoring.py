@@ -29,7 +29,9 @@ def build_runner_scores(runners: pd.DataFrame) -> pd.DataFrame:
     df["days_since"] = pd.to_numeric(df.get("days_since", 60), errors="coerce").fillna(60).clip(0, 365)
     df["recency"] = 1.0 - (df["days_since"].clip(0, 60) / 60.0)
 
-    df["recent_form_score"] = pd.to_numeric(df.get("recent_form_score", 0), errors="coerce").fillna(0.0).clip(0, 1)
+    df["recent_form_score"] = (
+        pd.to_numeric(df.get("recent_form_score", 0), errors="coerce").fillna(0.0).clip(0, 1)
+    )
     df["wins_last5"] = pd.to_numeric(df.get("wins_last5", 0), errors="coerce").fillna(0)
     df["places_last5"] = pd.to_numeric(df.get("places_last5", 0), errors="coerce").fillna(0)
     df["avg_pos_last3"] = pd.to_numeric(df.get("avg_pos_last3", 10), errors="coerce").fillna(10)
@@ -93,6 +95,13 @@ def build_runner_scores(runners: pd.DataFrame) -> pd.DataFrame:
     )
     df["value_edge"] = df["model_prob"] - df["market_prob"]
     df["confidence"] = (df["score_blended"] * 100).round(1)
+
+    # % columns for Sheets readability
+    df["market_prob_pct"] = (df["market_prob"] * 100).round(1)
+    df["model_prob_pct"] = (df["model_prob"] * 100).round(1)
+    df["value_edge_pct"] = (df["value_edge"] * 100).round(1)
+    df["recent_form_pct"] = (df["recent_form_score"] * 100).round(1)
+    df["going_fit_pct"] = (df["going_fit"] * 100).round(1)
 
     return df.sort_values(
         ["date", "course", "off_time", "value_edge"],
