@@ -351,3 +351,198 @@ class IrishRacingClient:
                     "course_distance": "",
                     "trainer": "",
                     "jockey": "",
+                    "weight": "",
+                    "age": "",
+                    "sex": "",
+                    "draw": "",
+                })
+
+        races_df = pd.DataFrame(races_rows)
+        runners_df = (
+            pd.DataFrame(runner_rows).drop_duplicates(subset=["race_id", "runner"])
+            if runner_rows
+            else pd.DataFrame()
+        )
+        return races_df, runners_df
+
+    def _fetch_horse_form_features(self, horse_url: str, max_runs: int = 8) -> dict:
+        try:
+            html = self.session.get(horse_url, timeout=self.timeout).text
+        except Exception:
+            return self._empty_form_features()
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True)
+        runs = self._parse_form_runs(text, max_runs=max_runs)
+        return self._features_from_runs(runs)
+
+    def _parse_form_runs(self, text: str, max_runs: int = 8) -> List[FormRun]:
+        runs: List[FormRun] = []
+        start = text.find("Form Timeline")
+        if start < 0:
+            start = text.find("Form Figures")
+        chunk = text[start : start + 8000] if start >= 0 else text
+
+        date_line_re = re.compile(
+            r"(?m)^(\d{1,2}[A-Za-z]{3}\d{2})\s+([A-Za-z]{2,6})\s+(\d+f\b[^\n]*)$"
+        )
+        matches = list(date_line_re.finditer(chunk))
+        for i, m in enumerate(matches[:max_runs]):
+            run_date = _parse_form_date(m.group(1))
+            course_code = m.group(2).strip()
+            rest = m.group(3).strip()
+
+            dist_m = re.match(r"(\d+f(?:\s*\d+y)?)\s+(.+)", rest)
+            distance = dist_m.group(1) if dist_m else ""
+            going_raw = dist_m.group(2) if dist_m else rest
+            going = re.split(
+                r"\d+y|\(|NHF|Hcap|H'cap|Mdn|Maiden|Novice|Stakes|Chase|Hurdle",
+                going_raw,
+            )[0]
+            going = _clean(going)
+
+            end = (
+                matches[i + 1].start()
+                if i + 1 < len(matches)
+                else min(len(chunk), m.end() + 400)
+            )
+            block = chunk[m.start() : end]
+
+            position, field_size = None, None
+            pm = re.search(r"(\d+)(?:st|nd|rd|th)/(\d+)", block, re.I)
+            if pm:
+                position = int(pm.group(1))
+                field_size = int(pm.group(2))
+            elif re.search(r"\b(pulled up|pu)\b", block, re.I):
+                position = 99
+            elif re.search(
+                r"\b(fell|unseated|ur|brought down|bd|refused)\b", block, re.I
+            ):
+                position = 99
+
+            sp_frac = ""
+            sm = re.search(r"(\d+/\d+)(?:Fav|JFav)?", block)
+            if sm:
+                sp_frac = sm.group(1)
+
+            runs.append(
+                FormRun(
+                    run_date=run_date,
+                    course_code=course_code,
+                    distance=distance,
+                    going=going,
+                    position=position,
+                    field_size=field_size,
+                    sp_frac=sp_frac,
+                    raw=block[:200],
+                )
+            )
+        return runs
+
+    def _features_from_runs(self, runs: List[FormRun]) -> dict:
+        feats = self._empty_form_features()
+        if not runs:
+            return feats
+
+        today = datetime.utcnow().date()
+        feats["form_runs"] = len(runs)
+
+        last = runs[0]
+        if last.run_date:
+            feats["days_since"] = max(0, (today - last.run_date).days)
+
+        recent = runs[:5]
+        scores = [_pos_score(r.position, r.field_size) for r in recent]
+        if scores:
+            weights = [1.0, 0.85, 0.7, 0.55, 0.4][: len(scores)]
+            wsum = sum(weights)
+            feats["recent_form_score"] = (
+                sum(s * w for s, w in zip(scores, weights)) / wsum
+            )
+
+        def is_win(r: FormRun) -> bool:
+            return r.position == 1
+
+        def is_place(r: FormRun) -> bool:
+            if r.position is None:
+                return False
+            if r.field_size and r.field_size >= 8:
+                return r.position <= 3
+            return r.position <= 2
+
+        feats["wins_last5"] = sum(1 for r in recent if is_win(r))
+        feats["places_last5"] = sum(1 for r in recent if is_place(r))
+
+        soft_keys = ("soft", "heavy", "yielding", "slow")
+        good_keys = ("good", "firm", "standard", "fast")
+        soft_runs = [r for r in runs if any(k in r.going.lower() for k in soft_keys)]
+        good_runs = [r for r in runs if any(k in r.going.lower() for k in good_keys)]
+        if soft_runs:
+            feats["soft_win_rate"] = sum(1 for r in soft_runs if is_win(r)) / len(
+                soft_runs
+            )
+            feats["soft_place_rate"] = sum(1 for r in soft_runs if is_place(r)) / len(
+                soft_runs
+            )
+        if good_runs:
+            feats["good_win_rate"] = sum(1 for r in good_runs if is_win(r)) / len(
+                good_runs
+            )
+            feats["good_place_rate"] = sum(1 for r in good_runs if is_place(r)) / len(
+                good_runs
+            )
+
+        feats["course_runs"] = len(runs)
+        feats["course_wins"] = sum(1 for r in runs if is_win(r))
+
+        last3 = [r for r in runs[:3] if r.position and r.position < 90]
+        if last3:
+            feats["avg_pos_last3"] = sum(r.position for r in last3) / len(last3)
+
+        parts = []
+        for r in runs[:6]:
+            if r.position is None:
+                parts.append("x")
+            elif r.position >= 90:
+                parts.append("P")
+            elif r.position >= 10:
+                parts.append("0")
+            else:
+                parts.append(str(r.position))
+        feats["form_string"] = "".join(parts)
+        return feats
+
+    @staticmethod
+    def _empty_form_features() -> dict:
+        return {
+            "form_runs": 0,
+            "days_since": 60,
+            "recent_form_score": 0.0,
+            "wins_last5": 0,
+            "places_last5": 0,
+            "soft_win_rate": 0.0,
+            "soft_place_rate": 0.0,
+            "good_win_rate": 0.0,
+            "good_place_rate": 0.0,
+            "course_runs": 0,
+            "course_wins": 0,
+            "avg_pos_last3": 10.0,
+            "form_string": "",
+        }
+
+    def _attach_empty_form_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        empty = self._empty_form_features()
+        out = df.copy()
+        for k, v in empty.items():
+            out[k] = v
+        return out
+
+    def _label_to_date(self, label: str) -> str:
+        try:
+            parts = label.split("-")
+            day = re.sub(r"\D", "", parts[1])
+            mon = parts[2]
+            year = parts[3]
+            dt = datetime.strptime(f"{day} {mon} {year}", "%d %b %Y")
+            return dt.date().isoformat()
+        except Exception:
+            return datetime.utcnow().date().isoformat()
