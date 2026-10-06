@@ -2,16 +2,22 @@ name: Horse Racing Model
 
 on:
   schedule:
-    # Every 20 minutes during typical racing hours (UTC). Adjust if you want.
-    - cron: "*/20 * * * *"
-  workflow_dispatch:
+    # 10:00 Dublin ≈ 09:00 UTC (IST) or 10:00 UTC (GMT)
+    - cron: "0 9 * * *"
+    - cron: "0 10 * * *"
+    # 22:00 Dublin ≈ 21:00 UTC (IST) or 22:00 UTC (GMT)
+    - cron: "0 21 * * *"
+    - cron: "0 22 * * *"
+  workflow_dispatch:  # manual "Run workflow" button
 
 jobs:
-  run:
+  run-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,12 +29,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run model + update sheet
+      - name: Write Google credentials
         env:
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+        run: echo "$GOOGLE_CREDS" > credentials.json
+
+      - name: Run horse model
+        env:
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           REGION: ${{ secrets.REGION }}
           MIN_VALUE_EDGE: ${{ secrets.MIN_VALUE_EDGE }}
-        run: |
-          echo "$GOOGLE_CREDS" > credentials.json
-          python horse_model.py
+          GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
+        run: python horse_model.py
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f credentials.json
