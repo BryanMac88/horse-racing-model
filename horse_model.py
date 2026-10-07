@@ -1,606 +1,708 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+Horse racing Google Sheet job (UK + Ireland), run on a schedule by GitHub Actions.
 
+What it does each run
+  1. Settles any PENDING bets in BET_TRACKER using results pages (position + SP).
+  2. Scrapes ALL UK/IRE meetings for the target day (today, or tomorrow after 22:00 Dublin).
+  3. Logs a price snapshot, then works out market movers against earlier snapshots.
+  4. Scores runners, picks BETS_TO_PLACE across all meetings, logs them in BET_TRACKER.
+  5. Rewrites the summary tabs, including TRACKER_SUMMARY (win % / place % / ROI).
+
+Environment variables
+  GOOGLE_CREDS    full service-account JSON (or put credentials.json next to this file)
+  SHEET_NAME      exact spreadsheet title, default "Horse Racing Model"
+  REGION          all | ire | gb          (default all)
+  MIN_VALUE_EDGE  default 0.02
+  MAX_BETS        max bets in BETS_TO_PLACE, default 12
+  MAX_PER_MEETING max bets from one meeting, default 3
+  DEBUG_DUMP      set to 1 to save fetched pages into ./debug (uploaded by the workflow)
+"""
+import datetime as dt
+import json
 import os
-from datetime import datetime, timezone, timedelta
+import re
+import sys
+import time
+from collections import defaultdict
+from urllib.parse import unquote, urljoin
 from zoneinfo import ZoneInfo
 
-import numpy as np
-import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 
-from src.sources.irishracing import IrishRacingClient
-from src.scoring import build_runner_scores, build_value_bets
-from src.sheets import SheetsWriter
-
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
 TZ = ZoneInfo("Europe/Dublin")
-NIGHT_BEFORE_HOUR = 22
-MIN_MOVE_PCT = 0.015
-MAX_RUNNERS_FOR_SIGNAL = 18
+BASE = "https://www.attheraces.com"
+SHEET_NAME = os.environ.get("SHEET_NAME") or "Horse Racing Model"
+REGION = (os.environ.get("REGION") or "all").strip().lower()
+MIN_EDGE = float(os.environ.get("MIN_VALUE_EDGE") or 0.02)
+MAX_BETS = int(os.environ.get("MAX_BETS") or 12)
+MAX_PER_MEETING = int(os.environ.get("MAX_PER_MEETING") or 3)
+DEBUG = os.environ.get("DEBUG_DUMP") == "1"
+
+MIN_DEC, MAX_DEC = 1.8, 13.0       # price window for selections (decimal odds)
+MOVER_MIN_AGE_MIN = 20             # a snapshot must be at least this old to be a reference
+MOVER_SHOW_PCT = 5.0               # show movers of at least this size
+REQUEST_PAUSE = 0.4                # seconds between page requests
+
+MONTHS = ["January", "February", "March", "April", "May", "June", "July",
+          "August", "September", "October", "November", "December"]
+
+IRISH = {
+    "ballinrobe", "bellewstown", "clonmel", "cork", "curragh", "downroyal", "downpatrick",
+    "dundalk", "fairyhouse", "galway", "gowranpark", "kilbeggan", "killarney", "laytown",
+    "leopardstown", "limerick", "listowel", "naas", "navan", "punchestown", "roscommon",
+    "sligo", "thurles", "tipperary", "tramore", "wexford", "newbridge", "kenmare",
+}
+GB = {
+    "aintree", "ascot", "ayr", "bangor", "bath", "beverley", "brighton", "carlisle", "cartmel",
+    "catterick", "chelmsford", "cheltenham", "chepstow", "chester", "doncaster", "epsom",
+    "exeter", "fakenham", "ffoslas", "fontwell", "goodwood", "hamilton", "haydock", "hereford",
+    "hexham", "huntingdon", "kelso", "kempton", "leicester", "lingfield", "ludlow",
+    "marketrasen", "musselburgh", "newbury", "newcastle", "newmarket", "newtonabbot",
+    "nottingham", "perth", "plumpton", "pontefract", "redcar", "ripon", "salisbury", "sandown",
+    "sedgefield", "southwell", "stratford", "taunton", "thirsk", "towcester", "uttoxeter",
+    "warwick", "wetherby", "wincanton", "windsor", "wolverhampton", "worcester", "yarmouth",
+    "york", "greatyarmouth",
+}
 
 
-def env(name: str, default: str | None = None) -> str:
-    v = os.getenv(name)
-    if v is None or v == "":
-        if default is None:
-            raise RuntimeError(f"Missing required env var: {name}")
+def log(*a):
+    print(*a, flush=True)
+
+
+# ----------------------------------------------------------------------------
+# Small helpers (pure functions, easy to test)
+# ----------------------------------------------------------------------------
+def norm(s):
+    """Lowercase letters/digits only, country tags like (IRE) removed."""
+    s = re.sub(r"\((?:[A-Za-z]{2,3})\)", "", s or "")
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def clean(t):
+    return " ".join((t or "").split())
+
+
+def display_name(t):
+    return re.sub(r"\s*\([A-Za-z]{2,3}\)\s*$", "", clean(t)).strip()
+
+
+def fmt_date(d):
+    return f"{d.day:02d}-{MONTHS[d.month - 1]}-{d.year}"
+
+
+def region_of(course):
+    n = norm(course)
+    if n in IRISH:
+        return "ire"
+    if any(n == g or n.startswith(g) or g.startswith(n) for g in GB):
+        return "gb"
+    return "other"
+
+
+def region_ok(region):
+    if region == "other":
+        return False
+    return REGION in ("all", "") or REGION == region
+
+
+FRAC_RE = re.compile(r"(?<![\d/])(\d{1,3})\s*/\s*(\d{1,3})(?![\d/])")
+EVENS_RE = re.compile(r"\b(?:evens|evs)\b", re.I)
+
+
+def parse_odds(text):
+    """Return (odds_text, decimal) from the first fractional price found, else (None, None)."""
+    text = text or ""
+    m = FRAC_RE.search(text)
+    e = EVENS_RE.search(text)
+    if e and (not m or e.start() < m.start()):
+        return "evens", 2.0
+    if m:
+        n, d = int(m.group(1)), int(m.group(2))
+        if d == 0:
+            return None, None
+        return f"{n}/{d}", round(n / d + 1, 3)
+    return None, None
+
+
+def place_terms(field, handicap):
+    """(places paid, fraction of win odds) using standard UK/IRE each-way terms."""
+    if field <= 4:
+        return 1, 1.0            # no place market, treat as winner only
+    if field <= 7:
+        return 2, 0.25
+    if handicap and field >= 16:
+        return 4, 0.25
+    if handicap:
+        return 3, 0.25
+    return 3, 0.2
+
+
+def to_float(x, default=None):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
         return default
+
+
+# ----------------------------------------------------------------------------
+# HTTP + parsing
+# ----------------------------------------------------------------------------
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept-Language": "en-GB,en;q=0.9",
+})
+
+
+def dump(url, text):
+    if not DEBUG:
+        return
+    os.makedirs("debug", exist_ok=True)
+    fn = re.sub(r"[^A-Za-z0-9]+", "_", url)[-150:] + ".html"
+    with open(os.path.join("debug", fn), "w", encoding="utf-8") as f:
+        f.write(text[:400000])
+
+
+def get(url, tries=3):
+    for i in range(tries):
+        try:
+            r = SESSION.get(url, timeout=30)
+            if r.status_code == 200:
+                dump(url, r.text)
+                time.sleep(REQUEST_PAUSE)
+                return r.text
+            log(f"  HTTP {r.status_code} for {url}")
+        except requests.RequestException as e:
+            log(f"  request error for {url}: {e}")
+        time.sleep(1.5 * (i + 1))
+    return None
+
+
+LINK_RE = re.compile(
+    r"/(?:racecard|results?|racecards)/([A-Za-z0-9\-_%]+)/(\d{1,2}-[A-Za-z]+-\d{4})/(\d{4})", re.I)
+HORSE_HREF = re.compile(r"/horse/", re.I)
+STATUS_RE = re.compile(r"\s*(PU|UR|BD|F|RO|SU|DSQ|REF|CO|LFT|DNF)\b")
+NR_RE = re.compile(r"\b(non[- ]?runner|NR)\b")
+
+
+def discover(index_urls, day):
+    """Find every race link for `day` on the given index pages -> {(course, hhmm): url}."""
+    want = fmt_date(day).lower()
+    found = {}
+    for url in index_urls:
+        html = get(url)
+        if not html:
+            continue
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            m = LINK_RE.search(a["href"])
+            if not m or m.group(2).lower() != want:
+                continue
+            course = clean(unquote(m.group(1)).replace("-", " ").replace("_", " ")).title()
+            found.setdefault((course, m.group(3)), urljoin(BASE, a["href"]))
+    return found
+
+
+def row_for(a):
+    """Climb from a horse link to the largest ancestor that contains only that one horse."""
+    row, node = None, a
+    for _ in range(10):
+        node = node.parent
+        if node is None:
+            break
+        names = {clean(h.get_text()) for h in node.find_all("a", href=HORSE_HREF)}
+        names.discard("")
+        if len(names) > 1:
+            break
+        row = node
+    return row
+
+
+def parse_rows(html):
+    """One entry per horse in page order: name, odds text, decimal, flags."""
+    soup = BeautifulSoup(html, "html.parser")
+    root = soup.find("main") or soup
+    entries, index = [], {}
+    for a in root.find_all("a", href=HORSE_HREF):
+        name = display_name(a.get_text(" ", strip=True))
+        if len(name) < 2:
+            continue
+        n = norm(name)
+        row = row_for(a)
+        text = clean(row.get_text(" ", strip=True)) if row else ""
+        odds, dec = parse_odds(text)
+        if n in index:
+            e = entries[index[n]]
+            if e["dec"] is None and dec is not None:
+                e["odds"], e["dec"] = odds, dec
+            continue
+        index[n] = len(entries)
+        entries.append({
+            "name": name, "norm": n, "odds": odds, "dec": dec,
+            "nr": bool(NR_RE.search(text)),
+            "status": bool(STATUS_RE.match(text)),
+        })
+    title = clean(soup.title.get_text()) if soup.title else ""
+    h1 = soup.find("h1")
+    head = (title + " " + (clean(h1.get_text()) if h1 else "")).lower()
+    return entries, ("handicap" in head or "hcap" in head)
+
+
+# ----------------------------------------------------------------------------
+# Scrape the target day
+# ----------------------------------------------------------------------------
+def race_off(day, hhmm):
+    return dt.datetime.combine(day, dt.time(int(hhmm[:2]), int(hhmm[2:])), tzinfo=TZ)
+
+
+def scrape_day(day, now, warnings):
+    today = now.date()
+    idx = [f"{BASE}/racecards/{fmt_date(day)}"]
+    if day == today:
+        idx.append(f"{BASE}/racecards")
+    links = discover(idx, day)
+    log(f"Found {len(links)} race links for {day}")
+    races, runners, per_meeting = [], [], defaultdict(lambda: [0, 0])
+    for (course, hhmm), url in sorted(links.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        region = region_of(course)
+        if not region_ok(region):
+            continue
+        off = race_off(day, hhmm)
+        if off < now + dt.timedelta(minutes=2):
+            continue                       # already off, nothing to bet on or snapshot
+        html = get(url)
+        if not html:
+            warnings.append(f"fetch failed {course} {hhmm}")
+            continue
+        entries, _ = parse_rows(html)
+        entries = [e for e in entries if not e["nr"]]
+        priced = [e for e in entries if e["dec"]]
+        per_meeting[course][0] += 1
+        per_meeting[course][1] += len(priced)
+        races.append({"date": day.isoformat(), "course": course, "region": region,
+                      "time": hhmm, "url": url, "runners": len(entries), "priced": len(priced)})
+        if len(priced) < 2:
+            warnings.append(f"{course} {hhmm}: only {len(priced)} priced runners parsed")
+            continue
+        for e in priced:
+            runners.append({"date": day.isoformat(), "course": course, "region": region,
+                            "time": hhmm, "off": off, "horse": e["name"], "norm": e["norm"],
+                            "odds": e["odds"], "dec": e["dec"]})
+    return races, runners, per_meeting
+
+
+# ----------------------------------------------------------------------------
+# Market movers
+# ----------------------------------------------------------------------------
+def snap_key(date, course, hhmm, horse):
+    return f"{date}|{norm(course)}|{hhmm}|{norm(horse)}"
+
+
+def pick_ref(hist, now, target_min=120, lo=MOVER_MIN_AGE_MIN, hi=300):
+    """Snapshot closest to `target_min` minutes ago, within [lo, hi] minutes old."""
+    best = None
+    for ts, dec in hist:
+        age = (now - ts).total_seconds() / 60
+        if lo <= age <= hi:
+            d = abs(age - target_min)
+            if best is None or d < best[0]:
+                best = (d, dec)
+    return best[1] if best else None
+
+
+def pick_open(hist, now, lo=MOVER_MIN_AGE_MIN):
+    """Earliest snapshot of the day that is at least `lo` minutes old."""
+    old = [(ts, dec) for ts, dec in hist if (now - ts).total_seconds() / 60 >= lo]
+    return min(old)[1] if old else None
+
+
+def add_movers(runners, snaps, now):
+    for r in runners:
+        hist = snaps.get(snap_key(r["date"], r["course"], r["time"], r["horse"]), [])
+        ref2, refo = pick_ref(hist, now), pick_open(hist, now)
+        r["mover_2h_pct"] = round((r["dec"] - ref2) / ref2 * 100, 1) if ref2 else None
+        r["mover_night_pct"] = round((r["dec"] - refo) / refo * 100, 1) if refo else None
+
+
+# ----------------------------------------------------------------------------
+# Model (simple, market based placeholder: swap in your own scoring here)
+# ----------------------------------------------------------------------------
+def add_model(runners):
+    by_race = defaultdict(list)
+    for r in runners:
+        by_race[(r["date"], r["course"], r["time"])].append(r)
+    for field in by_race.values():
+        raw = [1.0 / r["dec"] for r in field]
+        tot = sum(raw)
+        fair = [p / tot for p in raw]
+        adj = [p ** 1.1 for p in fair]              # favourite / longshot bias correction
+        for r, f, a in zip(field, fair, adj):
+            move = r.get("mover_night_pct")
+            if move is None:
+                move = r.get("mover_2h_pct")
+            bonus = min(0.03, max(0.0, -(move or 0.0)) / 100 * 0.15)   # shortening = support
+            r["fair_prob"], r["_adj"] = f, a + bonus
+        s = sum(r["_adj"] for r in field)
+        for r in field:
+            r["model_prob"] = r.pop("_adj") / s
+            r["value_edge"] = r["model_prob"] - r["fair_prob"]
+            r["ev"] = r["model_prob"] * r["dec"] - 1
+            r["shorten_score"] = round(max(0.0, -(r.get("mover_2h_pct") or 0.0))
+                                       + 0.5 * max(0.0, -(r.get("mover_night_pct") or 0.0)), 1)
+
+
+def choose_bets(runners):
+    best = {}
+    for r in runners:
+        if r["value_edge"] >= MIN_EDGE and MIN_DEC <= r["dec"] <= MAX_DEC:
+            k = (r["date"], r["course"], r["time"])
+            if k not in best or r["value_edge"] > best[k]["value_edge"]:
+                best[k] = r                             # one selection per race
+    picks, per_meet = [], defaultdict(int)
+    for r in sorted(best.values(), key=lambda x: -x["value_edge"]):
+        if per_meet[r["course"]] >= MAX_PER_MEETING:
+            continue
+        picks.append(r)
+        per_meet[r["course"]] += 1
+        if len(picks) >= MAX_BETS:
+            break
+    return sorted(picks, key=lambda x: (x["time"], x["course"]))
+
+
+# ----------------------------------------------------------------------------
+# Bet tracker: settle from results, summarise
+# ----------------------------------------------------------------------------
+TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pick",
+                "dec_at_pick", "model_prob", "value_edge", "status", "position",
+                "field_size", "places_paid", "sp", "sp_dec", "won", "placed",
+                "pnl_win_units", "pnl_place_units", "settled_at"]
+
+
+def settle_row(row, finishers, handicap, now):
+    """Fill result columns on a tracker row. finishers = parse_rows() entries in finish order."""
+    runners = [e for e in finishers if not e["nr"]]
+    names = [e["norm"] for e in runners]
+    target = norm(row["horse"])
+    if target not in names:
+        row["status"] = "UNMATCHED"       # horse not on the result page: check by hand (or NR)
+        return
+    i = names.index(target)
+    e = runners[i]
+    field = len(runners)
+    pos = 99 if e["status"] else i + 1
+    places, frac = place_terms(field, handicap)
+    sp_dec = e["dec"] or to_float(row.get("dec_at_pick"), 2.0)
+    won = pos == 1
+    placed = pos <= places
+    place_odds = (sp_dec - 1) * frac + 1
+    row.update({
+        "status": "SETTLED", "position": pos if pos != 99 else "DNF", "field_size": field,
+        "places_paid": places, "sp": e["odds"] or "", "sp_dec": round(sp_dec, 3),
+        "won": 1 if won else 0, "placed": 1 if placed else 0,
+        "pnl_win_units": round(sp_dec - 1 if won else -1, 3),
+        "pnl_place_units": round(place_odds - 1 if placed else -1, 3),
+        "settled_at": now.isoformat(timespec="minutes"),
+    })
+
+
+def fetch_results_for(day, needed):
+    """needed = set of (norm course, hhmm). Returns {(norm course, hhmm): (entries, handicap)}."""
+    links = discover([f"{BASE}/results/{fmt_date(day)}"], day)
+    out = {}
+    for (course, hhmm), url in links.items():
+        k = (norm(course), hhmm)
+        if k not in needed:
+            continue
+        html = get(url)
+        if html:
+            out[k] = parse_rows(html)
+    return out
+
+
+def settle_all(rows, now, warnings):
+    pending = defaultdict(list)
+    for r in rows:
+        if r.get("status") == "PENDING":
+            pending[r["date"]].append(r)
+    for date_s, group in pending.items():
+        try:
+            day = dt.date.fromisoformat(date_s)
+        except ValueError:
+            continue
+        due = [r for r in group if now >= race_off(day, r["time"]) + dt.timedelta(minutes=25)]
+        if not due:
+            continue
+        needed = {(norm(r["course"]), r["time"]) for r in due}
+        results = fetch_results_for(day, needed)
+        for r in due:
+            res = results.get((norm(r["course"]), r["time"]))
+            if res is None:
+                if now > race_off(day, r["time"]) + dt.timedelta(hours=48):
+                    r["status"] = "NO_RESULT"
+                continue
+            entries, handicap = res
+            if len(entries) < 2:
+                warnings.append(f"result page empty: {r['course']} {r['time']}")
+                continue
+            settle_row(r, entries, handicap, now)
+
+
+def band(x, cuts, labels):
+    for c, lab in zip(cuts, labels):
+        if x < c:
+            return lab
+    return labels[-1]
+
+
+def summarise(rows):
+    settled = [r for r in rows if r.get("status") == "SETTLED"]
+    groups = {"ALL BETS": settled}
+    for r in settled:
+        edge = to_float(r.get("value_edge"), 0)
+        dec = to_float(r.get("sp_dec"), 0)
+        groups.setdefault("Region: " + str(r["region"]), []).append(r)
+        groups.setdefault("Edge " + band(edge, [0.03, 0.05], ["2-3%", "3-5%", "5%+"]), []).append(r)
+        groups.setdefault("Odds " + band(dec, [2.5, 5, 10], ["<1.5/1", "1.5/1-4/1", "4/1-9/1", "9/1+"]), []).append(r)
+        fs = to_float(r.get("field_size"), 0)
+        groups.setdefault("Field " + band(fs, [8, 13], ["<8", "8-12", "13+"]), []).append(r)
+    header = ["Segment", "Bets", "Wins", "Win %", "Places", "Place %",
+              "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %"]
+    out = []
+    for name in sorted(groups, key=lambda s: (s != "ALL BETS", s)):
+        g = groups[name]
+        n = len(g)
+        if n == 0:
+            out.append([name, 0, 0, "", 0, "", 0, "", 0, ""])
+            continue
+        w = sum(int(to_float(r["won"], 0)) for r in g)
+        p = sum(int(to_float(r["placed"], 0)) for r in g)
+        wp = sum(to_float(r["pnl_win_units"], 0) for r in g)
+        pp = sum(to_float(r["pnl_place_units"], 0) for r in g)
+        out.append([name, n, w, round(w / n * 100, 1), p, round(p / n * 100, 1),
+                    round(wp, 2), round(wp / n * 100, 1), round(pp, 2), round(pp / n * 100, 1)])
+    counts = defaultdict(int)
+    for r in rows:
+        counts[r.get("status", "")] += 1
+    out.append([])
+    out.append(["Status counts: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))])
+    return header, out
+
+
+# ----------------------------------------------------------------------------
+# Google Sheets helpers
+# ----------------------------------------------------------------------------
+def open_sheet():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    scopes = ["https://www.googleapis.com/auth/spreadsheets",
+              "https://www.googleapis.com/auth/drive"]
+    raw = os.environ.get("GOOGLE_CREDS")
+    if raw:
+        creds = Credentials.from_service_account_info(json.loads(raw), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
+    return gspread.authorize(creds).open(SHEET_NAME)
+
+
+def get_tab(sh, name):
+    import gspread
+    try:
+        return sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(title=name, rows=1000, cols=26)
+
+
+def cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return round(v, 4)
+    if isinstance(v, (dt.datetime, dt.date)):
+        return v.isoformat()
     return v
 
 
-def _normalize_off_time(s: str) -> str:
-    t = str(s).strip()
-    if not t:
-        return t
-    t = t.replace(".", ":")
-    m = pd.Series([t]).str.extract(r"^(\d{1,2}):(\d{2})$").iloc[0]
-    if pd.isna(m[0]) or pd.isna(m[1]):
-        return t
-    return f"{int(m[0]):02d}:{int(m[1]):02d}"
+def write_tab(sh, name, header, rows):
+    ws = get_tab(sh, name)
+    values = [[cell(c) for c in header]] + [[cell(c) for c in r] for r in rows]
+    ws.clear()
+    ws.resize(rows=max(len(values) + 20, 50), cols=max(len(header), 12))
+    ws.update(values=values, range_name="A1")
 
 
-def _snapshot_period(local_dt: datetime, target_date, after_cutoff: bool) -> str:
-    hour = local_dt.hour
-    snap_date = local_dt.date()
-    if snap_date == (target_date - timedelta(days=1)) and hour >= 20:
-        return "NIGHT_BEFORE"
-    if snap_date == target_date and hour < 7:
-        return "NIGHT_BEFORE"
-    if snap_date == target_date and 7 <= hour < 12:
-        return "MORNING"
-    if snap_date == target_date and hour >= 12:
-        return "AFTERNOON"
-    if after_cutoff and snap_date == target_date - timedelta(days=1):
-        return "NIGHT_BEFORE"
-    return "OTHER"
-
-
-def _prep_snapshots_df(raw: pd.DataFrame) -> pd.DataFrame:
-    if raw is None or raw.empty:
-        return pd.DataFrame()
-    df = raw.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-    required = {"snapshot_time", "race_id", "runner", "best_price_dec"}
-    if not required.issubset(set(df.columns)):
-        return pd.DataFrame()
-    df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce", utc=True)
-    df["best_price_dec"] = pd.to_numeric(df["best_price_dec"], errors="coerce")
-    df = df.dropna(subset=["snapshot_time", "best_price_dec", "race_id", "runner"]).copy()
-    df["race_id"] = df["race_id"].astype(str).str.strip()
-    df["runner"] = df["runner"].astype(str).str.strip()
-    df["snapshot_local"] = df["snapshot_time"].dt.tz_convert(TZ)
-    if "off_time" in df.columns:
-        df["off_time_norm"] = df["off_time"].astype(str).apply(_normalize_off_time)
-    else:
-        df["off_time_norm"] = ""
-    df["race_dt"] = pd.NaT
-    if "date" in df.columns and "off_time_norm" in df.columns:
-        race_dt = pd.to_datetime(
-            df["date"].astype(str) + " " + df["off_time_norm"].astype(str), errors="coerce"
-        )
-        race_dt = race_dt.dt.tz_localize(TZ, nonexistent="shift_forward", ambiguous="NaT")
-        df["race_dt"] = race_dt
-    return df
-
-
-def _latest_per_runner(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d = df.sort_values("snapshot_local")
-    return d.groupby(["race_id", "runner"], as_index=False).tail(1)
-
-
-def _first_per_runner(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d = df.sort_values("snapshot_local")
-    return d.groupby(["race_id", "runner"], as_index=False).head(1)
-
-
-def build_price_tabs(snap_log: pd.DataFrame, target_date) -> dict:
-    empty = pd.DataFrame()
-    if snap_log is None or snap_log.empty:
-        return {"PRICES_NIGHT_BEFORE": empty, "PRICES_MORNING": empty, "PRICES_LATEST": empty}
-
-    d = snap_log.copy()
-    if "date" in d.columns:
-        d = d[d["date"].astype(str) == target_date.isoformat()].copy()
-    if d.empty:
-        return {"PRICES_NIGHT_BEFORE": empty, "PRICES_MORNING": empty, "PRICES_LATEST": empty}
-
-    if "period" not in d.columns or d["period"].astype(str).str.len().eq(0).all():
-        d["period"] = d["snapshot_local"].apply(
-            lambda x: _snapshot_period(x, target_date, after_cutoff=False) if pd.notna(x) else "OTHER"
-        )
-
-    night = d[d["period"].astype(str) == "NIGHT_BEFORE"].copy()
-    if night.empty:
-        night = _first_per_runner(d)
-        night["period"] = "NIGHT_BEFORE_FALLBACK"
-    else:
-        night = _first_per_runner(night)
-
-    morning = d[d["period"].astype(str) == "MORNING"].copy()
-    if morning.empty:
-        morning = d[
-            (d["snapshot_local"].dt.date == target_date)
-            & (d["snapshot_local"].dt.hour >= 7)
-            & (d["snapshot_local"].dt.hour < 12)
-        ].copy()
-    morning = _latest_per_runner(morning) if not morning.empty else empty
-
-    latest = _latest_per_runner(d)
-
-    def slim(x: pd.DataFrame) -> pd.DataFrame:
-        if x is None or x.empty:
-            return empty
-        cols = [
-            c for c in [
-                "snapshot_time", "snapshot_local", "period", "date", "course", "off_time",
-                "race_name", "race_id", "runner", "best_price_dec",
-            ] if c in x.columns
-        ]
-        return x[cols].sort_values([c for c in ["course", "off_time", "runner"] if c in cols])
-
-    return {
-        "PRICES_NIGHT_BEFORE": slim(night),
-        "PRICES_MORNING": slim(morning),
-        "PRICES_LATEST": slim(latest),
-    }
-
-
-def compute_movers_from_to(start_df: pd.DataFrame, end_df: pd.DataFrame) -> pd.DataFrame:
-    if start_df is None or end_df is None or start_df.empty or end_df.empty:
-        return pd.DataFrame()
-    s = start_df.copy()
-    e = end_df.copy()
-    key = ["race_id", "runner"]
-    for frame in (s, e):
-        frame["race_id"] = frame["race_id"].astype(str).str.strip()
-        frame["runner"] = frame["runner"].astype(str).str.strip()
-        frame["best_price_dec"] = pd.to_numeric(frame["best_price_dec"], errors="coerce")
-    s = s.dropna(subset=["best_price_dec"])
-    e = e.dropna(subset=["best_price_dec"])
-    if s.empty or e.empty:
-        return pd.DataFrame()
-
-    s2 = s[key + ["best_price_dec"]].rename(columns={"best_price_dec": "price_start"})
-    meta_cols = [c for c in ["date", "course", "off_time", "race_name"] if c in e.columns]
-    e2 = e[key + ["best_price_dec"] + meta_cols].rename(columns={"best_price_dec": "price_now"})
-    if "snapshot_local" in s.columns:
-        s2["time_start"] = s["snapshot_local"].values
-    if "snapshot_local" in e.columns:
-        e2["time_now"] = e["snapshot_local"].values
-
-    merged = s2.merge(e2, on=key, how="inner")
-    if merged.empty:
-        return pd.DataFrame()
-
-    merged["pct_change"] = (merged["price_now"] - merged["price_start"]) / merged["price_start"]
-    merged["direction"] = merged["pct_change"].apply(
-        lambda x: "SHORTENING" if x < 0 else ("DRIFTING" if x > 0 else "UNCHANGED")
-    )
-    merged["abs_pct"] = merged["pct_change"].abs()
-    merged = merged[merged["abs_pct"] >= MIN_MOVE_PCT].copy()
-    merged["pct_change_display"] = (merged["pct_change"] * 100).round(1)
-
-    keep = [c for c in [
-        "date", "course", "off_time", "race_name", "race_id", "runner",
-        "price_start", "price_now", "pct_change", "pct_change_display",
-        "direction", "time_start", "time_now",
-    ] if c in merged.columns]
-    return merged[keep].sort_values("pct_change", ascending=True)
-
-
-def compute_movers_last_two(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    d = df.dropna(subset=["snapshot_local", "best_price_dec", "race_id", "runner"]).copy()
-    d = d.sort_values(["race_id", "runner", "snapshot_local"])
-    key = ["race_id", "runner"]
-    last_two = d.groupby(key).tail(2).copy()
-    counts = last_two.groupby(key).size().reset_index(name="n")
-    valid = counts[counts["n"] >= 2][key]
-    if valid.empty:
-        return pd.DataFrame()
-    last_two = last_two.merge(valid, on=key, how="inner")
-    last_two["rn"] = last_two.groupby(key).cumcount()
-    prev = last_two[last_two["rn"] == 0].copy()
-    curr = last_two[last_two["rn"] == 1].copy()
-    curr_out = curr[key].copy()
-    curr_out["price_now"] = curr["best_price_dec"].values
-    curr_out["time_now"] = curr["snapshot_local"].values
-    for c in ["date", "course", "off_time", "race_name"]:
-        curr_out[c] = curr[c].values if c in curr.columns else ""
-    prev_out = prev[key].copy()
-    prev_out["price_prev"] = prev["best_price_dec"].values
-    prev_out["time_prev"] = prev["snapshot_local"].values
-    merged = prev_out.merge(curr_out, on=key, how="inner")
-    if merged.empty:
-        return pd.DataFrame()
-    merged["pct_change"] = (merged["price_now"] - merged["price_prev"]) / merged["price_prev"]
-    merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
-    merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
-    merged["pct_change_display"] = (merged["pct_change"] * 100).round(1)
-    keep = [
-        "date", "course", "off_time", "race_name", "race_id", "runner",
-        "price_prev", "price_now", "pct_change", "pct_change_display",
-        "direction", "time_prev", "time_now",
-    ]
-    return merged[keep].sort_values("pct_change", ascending=True)
-
-
-def compute_movers_night_before(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or "race_dt" not in df.columns:
-        return pd.DataFrame()
-    d = df.dropna(subset=["race_dt"]).copy()
-    if d.empty:
-        return pd.DataFrame()
-    d["night_start"] = (d["race_dt"].dt.normalize() - pd.Timedelta(days=1)) + pd.Timedelta(
-        hours=NIGHT_BEFORE_HOUR
-    )
-    d["cutoff_30m"] = d["race_dt"] - pd.Timedelta(minutes=30)
-    key = ["race_id", "runner"]
-    night = d[d["snapshot_local"] >= d["night_start"]].sort_values("snapshot_local")
-    night_first = night.groupby(key, as_index=False).first()
-    pre = d[d["snapshot_local"] <= d["cutoff_30m"]].sort_values("snapshot_local")
-    pre_last = pre.groupby(key, as_index=False).last()
-    merged = night_first.merge(
-        pre_last[key + ["best_price_dec", "snapshot_local"]],
-        on=key, how="inner", suffixes=("_start", "_30m"),
-    )
-    if merged.empty:
-        return pd.DataFrame()
-    merged = merged.rename(columns={
-        "best_price_dec_start": "start_price_night_before",
-        "best_price_dec_30m": "price_30min_before",
-        "snapshot_local_start": "time_start",
-        "snapshot_local_30m": "time_30min_before",
-    })
-    merged["pct_change"] = (
-        merged["price_30min_before"] - merged["start_price_night_before"]
-    ) / merged["start_price_night_before"]
-    merged["direction"] = merged["pct_change"].apply(lambda x: "SHORTENING" if x < 0 else "DRIFTING")
-    merged = merged[merged["pct_change"].abs() >= MIN_MOVE_PCT].copy()
-    for c in ["date", "course", "off_time", "race_name"]:
-        if c not in merged.columns:
-            merged[c] = ""
-    keep = [
-        "date", "course", "off_time", "race_name", "race_id", "runner",
-        "start_price_night_before", "price_30min_before", "pct_change", "direction",
-        "time_start", "time_30min_before",
-    ]
-    return merged[keep].sort_values("pct_change", ascending=True)
-
-
-def compute_persistent_shorteners(snap_df: pd.DataFrame) -> pd.DataFrame:
-    if snap_df is None or snap_df.empty:
-        return pd.DataFrame()
-    d = snap_df.dropna(subset=["race_id", "runner", "snapshot_local", "best_price_dec"]).copy()
-    d = d.sort_values(["race_id", "runner", "snapshot_local"])
-    key = ["race_id", "runner"]
-    last4 = d.groupby(key).tail(4).copy()
-    last4["prev_price"] = last4.groupby(key)["best_price_dec"].shift(1)
-    last4["down"] = (last4["best_price_dec"] < last4["prev_price"]).astype(int)
-    return (
-        last4.groupby(key, as_index=False)["down"]
-        .sum()
-        .rename(columns={"down": "shorten_steps_last4"})
-    )
-
-
-def build_signals(scored, movers_2h, movers_night, persistence) -> pd.DataFrame:
-    df = scored.copy()
-    df["runner_count"] = pd.to_numeric(df.get("runner_count", 0), errors="coerce").fillna(0)
-    df = df[df["runner_count"] <= MAX_RUNNERS_FOR_SIGNAL].copy()
-
-    df["value_edge"] = pd.to_numeric(df.get("value_edge", 0), errors="coerce").fillna(0.0)
-    df["win_score"] = pd.to_numeric(df.get("win_score", 0), errors="coerce").fillna(0.0)
-    df["is_favorite"] = pd.to_numeric(df.get("is_favorite", 0), errors="coerce").fillna(0).astype(int)
-    df["form_supports_fav"] = pd.to_numeric(df.get("form_supports_fav", 0), errors="coerce").fillna(0).astype(int)
-    df["form_quality"] = pd.to_numeric(df.get("form_quality", 0), errors="coerce").fillna(0.0)
-
-    def _mover_col(src, name):
-        if src is None or src.empty or "pct_change" not in src.columns:
-            return pd.DataFrame(columns=["race_id", "runner", name])
-        t = src[["race_id", "runner", "pct_change"]].rename(columns={"pct_change": name})
-        t["race_id"] = t["race_id"].astype(str).str.strip()
-        t["runner"] = t["runner"].astype(str).str.strip()
-        return t
-
-    m2 = _mover_col(movers_2h, "mover_2h_pct")
-    mn = _mover_col(movers_night, "mover_night_pct")
-    ps = (
-        persistence
-        if persistence is not None and not persistence.empty
-        else pd.DataFrame(columns=["race_id", "runner", "shorten_steps_last4"])
-    )
-    if not ps.empty:
-        ps = ps.copy()
-        ps["race_id"] = ps["race_id"].astype(str).str.strip()
-        ps["runner"] = ps["runner"].astype(str).str.strip()
-
-    df["race_id"] = df["race_id"].astype(str).str.strip()
-    df["runner"] = df["runner"].astype(str).str.strip()
-    out = (
-        df.merge(m2, on=["race_id", "runner"], how="left")
-        .merge(mn, on=["race_id", "runner"], how="left")
-        .merge(ps, on=["race_id", "runner"], how="left")
-    )
-    out["mover_2h_pct"] = pd.to_numeric(out.get("mover_2h_pct", 0), errors="coerce").fillna(0.0)
-    out["mover_night_pct"] = pd.to_numeric(out.get("mover_night_pct", 0), errors="coerce").fillna(0.0)
-    out["shorten_steps_last4"] = (
-        pd.to_numeric(out.get("shorten_steps_last4", 0), errors="coerce").fillna(0).astype(int)
-    )
-    out["shorten_boost"] = (
-        0.15 * (-out["mover_2h_pct"]).clip(lower=0)
-        + 0.20 * (-out["mover_night_pct"]).clip(lower=0)
-        + 0.05 * out["shorten_steps_last4"].clip(0, 3)
-    )
-    out["signal_score"] = (
-        1.00 * out["win_score"]
-        + 0.25 * out["form_quality"]
-        + 0.15 * out["is_favorite"]
-        + 0.20 * out["form_supports_fav"]
-        + out["shorten_boost"]
-        + 0.10 * out["value_edge"].clip(lower=0)
-    )
-    out["value_edge_pct"] = (out["value_edge"] * 100).round(1)
-    out["win_score_pct"] = (out["win_score"] * 100).round(1)
-    out["mover_2h_display_pct"] = (out["mover_2h_pct"] * 100).round(1)
-    out["mover_night_display_pct"] = (out["mover_night_pct"] * 100).round(1)
-    return out.sort_values(
-        ["date", "course", "off_time", "signal_score"], ascending=[True, True, True, False]
-    )
-
-
-def build_bets_to_place(signals: pd.DataFrame) -> pd.DataFrame:
-    if signals is None or signals.empty:
-        return pd.DataFrame()
-    df = signals.copy()
-    df["signal_score"] = pd.to_numeric(df.get("signal_score", 0), errors="coerce").fillna(0.0)
-    df["win_score"] = pd.to_numeric(df.get("win_score", 0), errors="coerce").fillna(0.0)
-    df["value_edge"] = pd.to_numeric(df.get("value_edge", 0), errors="coerce").fillna(0.0)
-    df["is_favorite"] = pd.to_numeric(df.get("is_favorite", 0), errors="coerce").fillna(0).astype(int)
-    df["form_supports_fav"] = pd.to_numeric(df.get("form_supports_fav", 0), errors="coerce").fillna(0).astype(int)
-    df["form_quality"] = pd.to_numeric(df.get("form_quality", 0), errors="coerce").fillna(0.0)
-    df["mover_2h_pct"] = pd.to_numeric(df.get("mover_2h_pct", 0), errors="coerce").fillna(0.0)
-    df["mover_night_pct"] = pd.to_numeric(df.get("mover_night_pct", 0), errors="coerce").fillna(0.0)
-
-    weak = (
-        (df["win_score"] < 0.08)
-        & (df["is_favorite"] == 0)
-        & (df["form_quality"] < 0.25)
-        & (df["mover_2h_pct"] > -MIN_MOVE_PCT)
-        & (df["mover_night_pct"] > -MIN_MOVE_PCT)
-    )
-    df = df[~weak].copy()
-    if df.empty:
-        return df
-
-    df["pick_tier"] = 1
-    df.loc[df["form_supports_fav"] == 1, "pick_tier"] = 3
-    solid = (
-        (df["form_quality"] >= 0.40)
-        | (df["win_score"] >= 0.22)
-        | (df["mover_2h_pct"] <= -MIN_MOVE_PCT)
-        | (df["mover_night_pct"] <= -MIN_MOVE_PCT)
-    )
-    df.loc[(df["pick_tier"] < 3) & solid, "pick_tier"] = 2
-    df["rank_key"] = df["pick_tier"] * 10.0 + df["signal_score"]
-    df["rank_in_race"] = df.groupby("race_id")["rank_key"].rank(ascending=False, method="first")
-
-    primary = df[df["rank_in_race"] == 1].copy()
-    primary["pick_role"] = "PRIMARY_WINNER"
-    primary["suggested_stake_units"] = np.where(primary["pick_tier"] >= 2, 1.0, 0.5)
-
-    second = df[df["rank_in_race"] == 2].copy()
-    if not second.empty and not primary.empty:
-        merged = second.merge(
-            primary[["race_id", "signal_score"]].rename(columns={"signal_score": "primary_score"}),
-            on="race_id", how="left",
-        )
-        keep_second = merged["signal_score"] >= (merged["primary_score"] * 0.85)
-        second = merged[keep_second].copy()
-        second["pick_role"] = "SECONDARY"
-        second["suggested_stake_units"] = 0.5
-        out = pd.concat([primary, second], ignore_index=True)
-    else:
-        out = primary
-
-    out["bet_key"] = (
-        out["date"].astype(str) + "|" + out["course"].astype(str) + "|"
-        + out["off_time"].astype(str) + "|" + out["runner"].astype(str)
-    )
-    if "value_edge_pct" not in out.columns:
-        out["value_edge_pct"] = (out["value_edge"] * 100).round(1)
-    if "win_score_pct" not in out.columns:
-        out["win_score_pct"] = (out["win_score"] * 100).round(1)
-    return out.sort_values(
-        ["date", "course", "off_time", "pick_tier", "signal_score"],
-        ascending=[True, True, True, False, False],
-    )
-
-
-def update_bet_recs_log(writer: SheetsWriter, bets_to_place: pd.DataFrame) -> None:
-    if bets_to_place is None or bets_to_place.empty or "bet_key" not in bets_to_place.columns:
+def append_rows(sh, name, header, rows):
+    if not rows:
         return
-    existing = writer.read_df("BET_RECS_LOG")
-    existing_keys = (
-        set(existing["bet_key"].astype(str).tolist())
-        if (not existing.empty and "bet_key" in existing.columns)
-        else set()
-    )
-    new_rows = bets_to_place[~bets_to_place["bet_key"].astype(str).isin(existing_keys)].copy()
-    if new_rows.empty:
-        return
-    out = pd.DataFrame()
-    out["timestamp_utc"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    out["bet_key"] = new_rows["bet_key"]
-    for c in [
-        "date", "course", "off_time", "race_name", "runner", "best_price_dec",
-        "signal_score", "win_score", "value_edge", "value_edge_pct",
-        "is_favorite", "form_supports_fav", "pick_role",
-        "mover_2h_pct", "mover_night_pct", "shorten_steps_last4", "suggested_stake_units",
-    ]:
-        out[c] = new_rows.get(c, "")
-    out["result"] = ""
-    out["pnl_units"] = ""
-    out["notes"] = ""
-    writer.append_df("BET_RECS_LOG", out)
+    ws = get_tab(sh, name)
+    if not ws.get_all_values()[:1]:
+        ws.append_row(header)
+    ws.append_rows([[cell(c) for c in r] for r in rows])
 
 
-def build_dashboard(races, runners, movers2h, moversnight, bets) -> pd.DataFrame:
-    return pd.DataFrame([
-        {"metric": "last_run_local", "value": datetime.now(timezone.utc).astimezone(TZ).isoformat(timespec="seconds")},
-        {"metric": "races_target_day", "value": int(len(races)) if races is not None else 0},
-        {"metric": "runners_target_day", "value": int(len(runners)) if runners is not None else 0},
-        {"metric": "movers_2h_rows", "value": int(len(movers2h)) if movers2h is not None else 0},
-        {"metric": "movers_night_rows", "value": int(len(moversnight)) if moversnight is not None else 0},
-        {"metric": "bets_to_place", "value": int(len(bets)) if bets is not None else 0},
-    ])
+def load_tracker(sh):
+    ws = get_tab(sh, "BET_TRACKER")
+    vals = ws.get_all_values()
+    if not vals:
+        return []
+    head = vals[0]
+    rows = []
+    for v in vals[1:]:
+        d = {h: (v[i] if i < len(v) else "") for i, h in enumerate(head)}
+        for c in TRACKER_COLS:
+            d.setdefault(c, "")
+        if d["key"]:
+            rows.append(d)
+    return rows
 
 
-def _order_runner_cols(df: pd.DataFrame) -> pd.DataFrame:
-    preferred = [
-        "date", "course", "off_time", "runner", "best_price_dec",
-        "is_favorite", "win_score_pct", "market_prob_pct", "model_prob_pct",
-        "value_edge_pct", "form_quality_pct", "form_supports_fav",
-        "recent_form_pct", "days_since", "form_string", "form_runs",
-        "going", "going_fit_pct", "wins_last5", "places_last5",
-        "race_name", "race_id",
-    ]
-    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
-    return df[cols]
+def save_tracker(sh, rows):
+    write_tab(sh, "BET_TRACKER", TRACKER_COLS, [[r.get(c, "") for c in TRACKER_COLS] for r in rows])
 
 
-def main() -> int:
-    sheet_name = env("SHEET_NAME")
-    region = env("REGION", "all").lower()
-    min_edge = float(env("MIN_VALUE_EDGE", "0.00"))
+def load_snapshots(sh, day):
+    """{key: [(ts, dec)]} for the day, pruning the log when it grows large."""
+    ws = get_tab(sh, "MARKET_SNAPSHOTS_LOG")
+    vals = ws.get_all_values()
+    snaps = defaultdict(list)
+    keep = []
+    cutoff = (day - dt.timedelta(days=3)).isoformat()
+    for v in vals[1:]:
+        if len(v) < 6:
+            continue
+        if v[1] >= cutoff:
+            keep.append(v)
+        if v[1] != day.isoformat():
+            continue
+        try:
+            snaps[snap_key(v[1], v[2], v[3], v[4])].append(
+                (dt.datetime.fromisoformat(v[0]), float(v[5])))
+        except ValueError:
+            continue
+    if len(vals) > 30000:
+        write_tab(sh, "MARKET_SNAPSHOTS_LOG", SNAP_HEAD, keep)
+    return snaps, max(0, len(vals) - 1)
 
-    client = IrishRacingClient(region=region)
-    now_utc = datetime.now(timezone.utc)
-    now_local = now_utc.astimezone(TZ)
-    today = now_local.date()
-    tomorrow = today + timedelta(days=1)
-    after_cutoff = now_local.hour >= NIGHT_BEFORE_HOUR
-    target_label = "TOMORROW" if after_cutoff else "TODAY"
-    target_date = tomorrow if after_cutoff else today
 
-    races_df, runners_df = client.fetch_for_date(target_date)
-    if races_df.empty or runners_df.empty:
-        print(f"No races/runners found for target_date={target_date} ({target_label}).")
-        return 0
+SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price"]
 
-    runners_df = client.enrich_with_best_prices(runners_df)
-    runners_df = client.enrich_with_form(runners_df, max_horses=80, max_workers=8, max_runs=8)
 
-    scored = build_runner_scores(runners_df)
-    value_bets = build_value_bets(scored, min_edge=min_edge)
-    writer = SheetsWriter(sheet_name=sheet_name, credentials_path="credentials.json")
-    period = _snapshot_period(now_local, target_date, after_cutoff)
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+def main():
+    now = dt.datetime.now(TZ)
+    day = now.date() + (dt.timedelta(days=1) if now.hour >= 22 else dt.timedelta(0))
+    warnings, status = [], "OK"
+    log(f"Run at {now:%Y-%m-%d %H:%M} Dublin, target day {day}, region={REGION}")
+    sh = open_sheet()
 
-    writer.write_df("TARGET_DAY", pd.DataFrame([{
-        "run_utc": now_utc.isoformat(timespec="seconds"),
-        "run_local_dublin": now_local.isoformat(timespec="seconds"),
-        "dublin_hour": int(now_local.hour),
-        "after_22_rule": bool(after_cutoff),
-        "target_label": target_label,
-        "target_date": target_date.isoformat(),
-        "snapshot_period": period,
-        "night_before_hour_local": NIGHT_BEFORE_HOUR,
-        "region": region,
-    }]))
+    # 1. settle old bets first so results are never lost
+    tracker = load_tracker(sh)
+    settle_all(tracker, now, warnings)
 
-    writer.write_df("RACES_TARGET", races_df)
-    writer.write_df("RUNNERS_TARGET", _order_runner_cols(scored))
-    writer.write_df("VALUE_BETS_TARGET", value_bets)
+    # 2. scrape target day
+    races, runners, per_meeting = scrape_day(day, now, warnings)
 
-    snapshots_new = scored[
-        ["date", "course", "off_time", "race_name", "race_id", "runner", "best_price_dec"]
-    ].copy()
-    snapshots_new.insert(0, "snapshot_time", now_utc.isoformat(timespec="seconds"))
-    snapshots_new.insert(1, "target_label", target_label)
-    snapshots_new.insert(2, "period", period)
-    writer.write_df("MARKET_SNAPSHOTS_TARGET", snapshots_new)
-    writer.append_df("MARKET_SNAPSHOTS_LOG", snapshots_new)
+    # 3. snapshots + movers
+    snaps, snap_rows = load_snapshots(sh, day)
+    add_movers(runners, snaps, now)
+    stamp = now.isoformat(timespec="seconds")
+    append_rows(sh, "MARKET_SNAPSHOTS_LOG", SNAP_HEAD,
+                [[stamp, r["date"], r["course"], r["time"], r["horse"], r["dec"]] for r in runners])
 
-    snap_log = _prep_snapshots_df(writer.read_df("MARKET_SNAPSHOTS_LOG"))
-    if not snap_log.empty and "date" in snap_log.columns:
-        snap_for_day = snap_log[snap_log["date"].astype(str) == target_date.isoformat()].copy()
-    else:
-        snap_for_day = snap_log
+    # 4. model + bets
+    add_model(runners)
+    runners.sort(key=lambda r: (r["time"], r["course"], r["dec"]))
+    bets = choose_bets(runners)
+    known = {r["key"] for r in tracker}
+    new_bets = 0
+    for b in bets:
+        key = f"{b['date']}|{norm(b['course'])}|{b['time']}|{norm(b['horse'])}"
+        if key in known:
+            continue
+        tracker.append({**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
+                        "course": b["course"], "time": b["time"], "region": b["region"],
+                        "horse": b["horse"], "odds_at_pick": b["odds"], "dec_at_pick": b["dec"],
+                        "model_prob": round(b["model_prob"], 4),
+                        "value_edge": round(b["value_edge"], 4), "status": "PENDING"})
+        new_bets += 1
+    save_tracker(sh, tracker)
 
-    if not snap_for_day.empty:
-        snap_for_day = snap_for_day.copy()
-        snap_for_day["period"] = snap_for_day["snapshot_local"].apply(
-            lambda x: _snapshot_period(x, target_date, after_cutoff) if pd.notna(x) else "OTHER"
-        )
+    # 5. write tabs
+    r_head = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
+              "value_edge", "ev", "mover_2h_pct", "mover_night_pct"]
 
-    price_tabs = build_price_tabs(snap_for_day, target_date)
-    writer.write_df("PRICES_NIGHT_BEFORE", price_tabs["PRICES_NIGHT_BEFORE"])
-    writer.write_df("PRICES_MORNING", price_tabs["PRICES_MORNING"])
-    writer.write_df("PRICES_LATEST", price_tabs["PRICES_LATEST"])
+    def rr(r):
+        return [r["date"], r["course"], r["region"], r["time"], r["horse"], r["odds"], r["dec"],
+                r["fair_prob"], r["model_prob"], r["value_edge"], r["ev"],
+                r["mover_2h_pct"], r["mover_night_pct"]]
 
-    movers_main = compute_movers_from_to(
-        price_tabs["PRICES_NIGHT_BEFORE"], price_tabs["PRICES_LATEST"]
-    )
-    movers_morning = compute_movers_from_to(
-        price_tabs["PRICES_MORNING"], price_tabs["PRICES_LATEST"]
-    )
-    movers_2h = compute_movers_last_two(snap_for_day)
-    persistence = compute_persistent_shorteners(snap_for_day)
+    if runners:
+        write_tab(sh, "RUNNERS_TARGET", r_head, [rr(r) for r in runners])
+        write_tab(sh, "SIGNALS", r_head + ["shorten_score"],
+                  [rr(r) + [r["shorten_score"]] for r in sorted(runners, key=lambda x: -x["value_edge"])])
+        write_tab(sh, "VALUE_BETS_TARGET", r_head,
+                  [rr(r) for r in sorted(runners, key=lambda x: -x["value_edge"])
+                   if r["value_edge"] >= MIN_EDGE])
+        write_tab(sh, "BETS_TO_PLACE", r_head, [rr(r) for r in bets])
+    write_tab(sh, "RACES_TARGET", ["date", "course", "region", "time", "url", "runners", "priced"],
+              [[x["date"], x["course"], x["region"], x["time"], x["url"], x["runners"], x["priced"]]
+               for x in races])
 
-    biggest = movers_main.copy() if movers_main is not None else pd.DataFrame()
-    if biggest.empty and movers_2h is not None and not movers_2h.empty:
-        biggest = movers_2h.rename(columns={"price_prev": "price_start", "time_prev": "time_start"})
+    m_head = ["course", "time", "horse", "odds", "dec", "ref_move_pct", "direction"]
 
-    writer.write_df("MARKET_MOVERS", biggest)
-    writer.write_df("MARKET_MOVERS_2H", movers_2h)
-    writer.write_df("MARKET_MOVERS_MORNING", movers_morning)
+    def movers(field):
+        rows = [r for r in runners if r.get(field) is not None and abs(r[field]) >= MOVER_SHOW_PCT]
+        rows.sort(key=lambda r: r[field])
+        return [[r["course"], r["time"], r["horse"], r["odds"], r["dec"], r[field],
+                 "shortening" if r[field] < 0 else "drifting"] for r in rows]
 
-    if biggest is not None and not biggest.empty:
-        shorteners = biggest[biggest["direction"] == "SHORTENING"].head(40)
-        drifters = biggest[biggest["direction"] == "DRIFTING"].sort_values(
-            "pct_change", ascending=False
-        ).head(40)
-    else:
-        shorteners = pd.DataFrame()
-        drifters = pd.DataFrame()
-    writer.write_df("BIGGEST_SHORTENERS", shorteners)
-    writer.write_df("BIGGEST_DRIFTERS", drifters)
+    n2h = sum(1 for r in runners if r.get("mover_2h_pct") is not None)
+    nnight = sum(1 for r in runners if r.get("mover_night_pct") is not None)
+    for tab, field, have in (("MARKET_MOVERS_2H", "mover_2h_pct", n2h),
+                             ("MARKET_MOVERS", "mover_night_pct", nnight)):
+        rows = movers(field)
+        if not rows:
+            msg = ("No reference snapshot yet: builds after ~20+ minutes of runs"
+                   if have == 0 else f"No moves of {MOVER_SHOW_PCT}%+ ({have} runners compared)")
+            rows = [[msg, "", "", "", "", "", ""]]
+        write_tab(sh, tab, m_head, rows)
 
-    signals = build_signals(scored, movers_2h, movers_main, persistence)
-    writer.write_df("SIGNALS", signals)
-    bets_to_place = build_bets_to_place(signals)
-    writer.write_df("BETS_TO_PLACE", bets_to_place)
-    update_bet_recs_log(writer, bets_to_place)
+    write_tab(sh, "TARGET_DAY", ["target_day", "generated"], [[day.isoformat(), stamp]])
+    head, srows = summarise(tracker)
+    write_tab(sh, "TRACKER_SUMMARY", head, srows)
 
-    dashboard = build_dashboard(races_df, scored, movers_2h, movers_main, bets_to_place)
-    writer.write_df("DASHBOARD", dashboard)
-    writer.write_df("RUN_LOG", pd.DataFrame([{
-        "run_utc": now_utc.isoformat(timespec="seconds"),
-        "run_local_dublin": now_local.isoformat(timespec="seconds"),
-        "region": region,
-        "target_label": target_label,
-        "target_date": target_date.isoformat(),
-        "snapshot_period": period,
-        "races": int(len(races_df)),
-        "runners": int(len(scored)),
-        "movers_main": int(len(biggest)) if biggest is not None else 0,
-        "movers_2h": int(len(movers_2h)) if movers_2h is not None else 0,
-        "bets": int(len(bets_to_place)),
-        "snap_log_rows": int(len(snap_for_day)) if snap_for_day is not None else 0,
-    }]))
-
-    print(
-        f"Update complete. target={target_label} {target_date} period={period} | "
-        f"races={len(races_df)} runners={len(scored)} "
-        f"movers={len(biggest) if biggest is not None else 0} "
-        f"movers_2h={len(movers_2h) if movers_2h is not None else 0} "
-        f"bets={len(bets_to_place)} snap_rows={len(snap_for_day) if snap_for_day is not None else 0}"
-    )
-    return 0
+    # 6. dashboard + log
+    if not runners:
+        status = "NO RUNNERS PARSED"
+    elif warnings:
+        status = "OK WITH WARNINGS"
+    dash = [["status", status], ["run_time", stamp], ["target_day", day.isoformat()],
+            ["region_filter", REGION], ["meetings", len(per_meeting)], ["races", len(races)],
+            ["runners_priced", len(runners)], ["bets_today", len(bets)],
+            ["new_bets_logged", new_bets], ["snapshot_rows", snap_rows],
+            ["runners_with_2h_ref", n2h], ["runners_with_night_ref", nnight],
+            ["pending_bets", sum(1 for r in tracker if r["status"] == "PENDING")],
+            ["settled_bets", sum(1 for r in tracker if r["status"] == "SETTLED")],
+            ["unmatched_bets", sum(1 for r in tracker if r["status"] == "UNMATCHED")], []]
+    for course, (nr, nrun) in sorted(per_meeting.items()):
+        dash.append([f"meeting: {course}", f"{nr} races, {nrun} priced runners"])
+    for w in warnings[:40]:
+        dash.append(["warning", w])
+    write_tab(sh, "DASHBOARD", ["item", "value"], dash)
+    append_rows(sh, "RUN_LOG", ["run_time", "target_day", "races", "runners", "bets", "status"],
+                [[stamp, day.isoformat(), len(races), len(runners), len(bets), status]])
+    log(f"Done: {status}, {len(races)} races, {len(runners)} runners, {len(bets)} bets, "
+        f"{new_bets} new")
+    if not runners:
+        sys.exit(1)       # make the Actions run go red so a broken scrape is obvious
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
