@@ -337,6 +337,7 @@ def scrape_day(day, now, warnings):
     links = discover(idx, day)
     log(f"Found {len(links)} race links for {day}")
     races, runners, per_meeting = [], [], defaultdict(lambda: [0, 0])
+    info = {"links": len(links), "upcoming": 0}
     for (course, hhmm), url in sorted(links.items(), key=lambda kv: (kv[0][1], kv[0][0])):
         region = region_of(course)
         if not region_ok(region):
@@ -344,6 +345,7 @@ def scrape_day(day, now, warnings):
         off = race_off(day, hhmm)
         if off < now + dt.timedelta(minutes=2):
             continue                       # already off, nothing to bet on or snapshot
+        info["upcoming"] += 1
         html = get(url)
         if not html:
             warnings.append(f"fetch failed {course} {hhmm}")
@@ -361,7 +363,7 @@ def scrape_day(day, now, warnings):
             runners.append({"date": day.isoformat(), "course": course, "region": region,
                             "time": hhmm, "off": off, "horse": e["name"], "norm": e["norm"],
                             "odds": e["odds"], "dec": e["dec"]})
-    return races, runners, per_meeting
+    return races, runners, per_meeting, info
 
 
 # ----------------------------------------------------------------------------
@@ -741,7 +743,13 @@ def main():
     settle_all(race_best, now, warnings)
 
     # 2. scrape target day
-    races, runners, per_meeting = scrape_day(day, now, warnings)
+    races, runners, per_meeting, info = scrape_day(day, now, warnings)
+    rolled = False
+    if day == now.date() and info["links"] > 0 and info["upcoming"] == 0:
+        rolled = True
+        day = day + dt.timedelta(days=1)          # today's racing is all over: do tomorrow
+        log(f"No races left today, moving on to {day}")
+        races, runners, per_meeting, info = scrape_day(day, now, warnings)
 
     # 3. snapshots + movers
     snaps, snap_rows = load_snapshots(sh, day)
@@ -830,10 +838,24 @@ def main():
     write_tab(sh, "RACE_BEST_SUMMARY", rhead, rrows)
 
     # 6. dashboard + log
-    if not runners:
+    entries_seen = sum(x["runners"] for x in races)
+    fatal = True
+    if info["links"] == 0 and rolled:
+        status, fatal = "TOMORROW'S CARD NOT PUBLISHED YET", False
+    elif info["links"] == 0:
+        status = "NO RACE LINKS FOUND (site blocked or layout changed)"
+    elif info["upcoming"] == 0:
+        status, fatal = "NO RACES LEFT", False
+    elif not races:
+        status = "RACE PAGES FAILED TO LOAD"
+    elif entries_seen == 0:
         status = "NO RUNNERS PARSED"
-    elif warnings:
-        status = "OK WITH WARNINGS"
+    elif not runners:
+        status, fatal = "NO PRICES YET (Probable SP not published)", False
+    else:
+        fatal = False
+        if warnings:
+            status = "OK WITH WARNINGS"
     dash = [["status", status], ["run_time", stamp], ["target_day", day.isoformat()],
             ["region_filter", REGION], ["meetings", len(per_meeting)], ["races", len(races)],
             ["runners_priced", len(runners)], ["bets_today", len(bets)],
@@ -859,7 +881,7 @@ def main():
         log(f"  could not tidy tabs: {ex}")
     log(f"Done: {status}, {len(races)} races, {len(runners)} runners, {len(bets)} bets, "
         f"{new_bets} new")
-    if not runners:
+    if fatal:
         sys.exit(1)       # make the Actions run go red so a broken scrape is obvious
 
 
