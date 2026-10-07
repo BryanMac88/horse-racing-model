@@ -454,6 +454,12 @@ def choose_best_per_race(runners):
     return sorted(picks, key=lambda x: (x["date"], x["time"], x["course"]))
 
 
+def card_order(r):
+    """Newest day first, then each course grouped together with its races in time order."""
+    d = dt.date.fromisoformat(r["date"]).toordinal() if r.get("date") else 0
+    return (-d, r["course"], r["time"])
+
+
 def upsert_race_bests(rows, picks):
     """One row per race. A PENDING row is re-picked on each run until the race is off
     (the scrape only sees races still to run); settled or started races are left alone."""
@@ -697,6 +703,27 @@ def load_snapshots(sh, day):
 SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price"]
 
 
+VISIBLE_TABS = ["BEST_PER_RACE", "BETS_TO_PLACE", "RACE_BEST_SUMMARY", "RACE_BEST_TRACKER"]
+
+
+def tidy_tabs(sh):
+    """Show only VISIBLE_TABS (in that order, first); hide every other tab. Hidden tabs keep updating."""
+    for name in VISIBLE_TABS:
+        get_tab(sh, name)                       # make sure they exist before anything is hidden
+    sheets = sh.worksheets()
+    by_name = {w.title: w for w in sheets}
+    for name in VISIBLE_TABS:                   # unhide first: Google needs one visible tab
+        ws = by_name[name]
+        if ws._properties.get("hidden"):
+            ws.show()
+    for ws in sheets:
+        if ws.title not in VISIBLE_TABS and not ws._properties.get("hidden"):
+            ws.hide()
+    wanted = [by_name[n] for n in VISIBLE_TABS] + [w for w in sheets if w.title not in VISIBLE_TABS]
+    if [w.title for w in sheets] != [w.title for w in wanted]:
+        sh.reorder_worksheets(wanted)
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -790,8 +817,7 @@ def main():
     write_tab(sh, "TRACKER_SUMMARY", head, srows)
 
     recent = (day - dt.timedelta(days=1)).isoformat()
-    card = sorted((r for r in race_best if r["date"] >= recent),
-                  key=lambda r: (r["date"], r["time"], r["course"]))
+    card = sorted((r for r in race_best if r["date"] >= recent), key=card_order)
     write_tab(sh, "BEST_PER_RACE",
               ["date", "time", "course", "region", "horse", "odds", "model_prob", "value_edge",
                "status", "position", "field_size", "sp", "won", "placed",
@@ -827,6 +853,10 @@ def main():
     write_tab(sh, "DASHBOARD", ["item", "value"], dash)
     append_rows(sh, "RUN_LOG", ["run_time", "target_day", "races", "runners", "bets", "status"],
                 [[stamp, day.isoformat(), len(races), len(runners), len(bets), status]])
+    try:
+        tidy_tabs(sh)
+    except Exception as ex:                     # cosmetic only, never fail the run for it
+        log(f"  could not tidy tabs: {ex}")
     log(f"Done: {status}, {len(races)} races, {len(runners)} runners, {len(bets)} bets, "
         f"{new_bets} new")
     if not runners:
