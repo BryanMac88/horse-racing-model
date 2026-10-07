@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Horse racing Google Sheet job (UK + Ireland), run on a schedule by GitHub Actions.
+Source: irishracing.com (Probable SP before the race, official SP + finishing order after).
 
 What it does each run
   1. Settles any PENDING bets in BET_TRACKER using results pages (position + SP).
@@ -35,7 +36,7 @@ from bs4 import BeautifulSoup
 # Config
 # ----------------------------------------------------------------------------
 TZ = ZoneInfo("Europe/Dublin")
-BASE = "https://www.attheraces.com"
+BASE = "https://www.irishracing.com"
 SHEET_NAME = os.environ.get("SHEET_NAME") or "Horse Racing Model"
 REGION = (os.environ.get("REGION") or "all").strip().lower()
 MIN_EDGE = float(os.environ.get("MIN_VALUE_EDGE") or 0.02)
@@ -48,8 +49,8 @@ MOVER_MIN_AGE_MIN = 20             # a snapshot must be at least this old to be 
 MOVER_SHOW_PCT = 5.0               # show movers of at least this size
 REQUEST_PAUSE = 0.4                # seconds between page requests
 
-MONTHS = ["January", "February", "March", "April", "May", "June", "July",
-          "August", "September", "October", "November", "December"]
+DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 IRISH = {
     "ballinrobe", "bellewstown", "clonmel", "cork", "curragh", "downroyal", "downpatrick",
@@ -91,8 +92,15 @@ def display_name(t):
     return re.sub(r"\s*\([A-Za-z]{2,3}\)\s*$", "", clean(t)).strip()
 
 
+def ordinal(n):
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
 def fmt_date(d):
-    return f"{d.day:02d}-{MONTHS[d.month - 1]}-{d.year}"
+    """irishracing.com date slug, e.g. Wed-7th-Oct-2026."""
+    return f"{DOW[d.weekday()]}-{d.day}{ordinal(d.day)}-{MON3[d.month - 1]}-{d.year}"
 
 
 def region_of(course):
@@ -178,6 +186,8 @@ def get(url, tries=3):
                 time.sleep(REQUEST_PAUSE)
                 return r.text
             log(f"  HTTP {r.status_code} for {url}")
+            if r.status_code in (404, 410):
+                return None
         except requests.RequestException as e:
             log(f"  request error for {url}: {e}")
         time.sleep(1.5 * (i + 1))
@@ -185,10 +195,15 @@ def get(url, tries=3):
 
 
 LINK_RE = re.compile(
-    r"/(?:racecard|results?|racecards)/([A-Za-z0-9\-_%]+)/(\d{1,2}-[A-Za-z]+-\d{4})/(\d{4})", re.I)
+    r"/(?:racecards|raceresults)/([A-Za-z]{3}-\d{1,2}(?:st|nd|rd|th)-[A-Za-z]{3}-\d{4})"
+    r"/([^/\s?#\"']+)/(\d{4})", re.I)
 HORSE_HREF = re.compile(r"/horse/", re.I)
-STATUS_RE = re.compile(r"\s*(PU|UR|BD|F|RO|SU|DSQ|REF|CO|LFT|DNF)\b")
-NR_RE = re.compile(r"\b(non[- ]?runner|NR)\b")
+SP_LABEL = re.compile(r"Probable\s*SP", re.I)
+PRICE_PIECE = re.compile(r"^(\d{1,3}\s*/\s*\d{1,3}|evens|evs)\s+(.+)$", re.I)
+ORD_RE = re.compile(r"^\s*(\d{1,2})(?:st|nd|rd|th)\b")
+STATUS_RE = re.compile(r"^\s*(PU|UR|BD|F|RO|SU|DSQ|REF|CO|LFT|DNF|VOID)\b")
+SP_RE = re.compile(r"\bSP\s+(\d{1,3}\s*/\s*\d{1,3}|evens|evs)", re.I)
+HCAP_RE = re.compile(r"h['\u2019]?cap|handicap", re.I)
 
 
 def discover(index_urls, day):
@@ -202,9 +217,9 @@ def discover(index_urls, day):
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             m = LINK_RE.search(a["href"])
-            if not m or m.group(2).lower() != want:
+            if not m or m.group(1).lower() != want:
                 continue
-            course = clean(unquote(m.group(1)).replace("-", " ").replace("_", " ")).title()
+            course = clean(unquote(m.group(2)).replace("-", " ").replace("_", " ")).title()
             found.setdefault((course, m.group(3)), urljoin(BASE, a["href"]))
     return found
 
@@ -224,34 +239,83 @@ def row_for(a):
     return row
 
 
-def parse_rows(html):
-    """One entry per horse in page order: name, odds text, decimal, flags."""
+def horse_rows(soup):
+    """[(name, norm, row_text)] for each distinct horse link, in page order."""
+    for root in (soup.find("main"), soup):
+        if root is None:
+            continue
+        out, seen = [], set()
+        for a in root.find_all("a", href=HORSE_HREF):
+            name = display_name(a.get_text(" ", strip=True))
+            n = norm(name)
+            if len(name) < 2 or n in seen:
+                continue
+            seen.add(n)
+            row = row_for(a)
+            out.append((name, n, clean(row.get_text(" ", strip=True)) if row else ""))
+        if out:
+            return out
+    return []
+
+
+def parse_probable_sp(soup):
+    """'Probable SP 11/4 Silver Trumpet, 3/1 Caragio, 8/1 Lady Manzor, Timely Affair' -> {norm: odds}."""
+    node = soup.find(string=SP_LABEL)
+    if node is None:
+        return {}
+    el, after = node.parent, ""
+    for _ in range(4):
+        text = clean(el.get_text(" ", strip=True))
+        parts = SP_LABEL.split(text, 1)
+        after = parts[1] if len(parts) > 1 else ""
+        if FRAC_RE.search(after) or EVENS_RE.search(after):
+            break
+        if el.parent is None:
+            break
+        el = el.parent
+    after = re.split(r"Previous Years|Symbols Explained|First Time", after)[0].strip().rstrip(".")
+    prices, cur = {}, None
+    for piece in after.split(","):
+        piece = clean(piece).strip(" .")
+        if not piece:
+            continue
+        m = PRICE_PIECE.match(piece)
+        if m:
+            cur, name = m.group(1), m.group(2)
+        else:
+            name = piece
+        if cur is not None:
+            prices[norm(name)] = cur
+    return prices
+
+
+def parse_racecard(html):
+    """Runners in card order, priced from the page's Probable SP line."""
     soup = BeautifulSoup(html, "html.parser")
-    root = soup.find("main") or soup
-    entries, index = [], {}
-    for a in root.find_all("a", href=HORSE_HREF):
-        name = display_name(a.get_text(" ", strip=True))
-        if len(name) < 2:
-            continue
-        n = norm(name)
-        row = row_for(a)
-        text = clean(row.get_text(" ", strip=True)) if row else ""
-        odds, dec = parse_odds(text)
-        if n in index:
-            e = entries[index[n]]
-            if e["dec"] is None and dec is not None:
-                e["odds"], e["dec"] = odds, dec
-            continue
-        index[n] = len(entries)
-        entries.append({
-            "name": name, "norm": n, "odds": odds, "dec": dec,
-            "nr": bool(NR_RE.search(text)),
-            "status": bool(STATUS_RE.match(text)),
-        })
+    prices = parse_probable_sp(soup)
+    entries = []
+    for name, n, _ in horse_rows(soup):
+        odds, dec = parse_odds(prices.get(n, ""))
+        entries.append({"name": name, "norm": n, "odds": odds, "dec": dec,
+                        "nr": False, "pos": None, "status": False})
+    return entries
+
+
+def parse_result(html):
+    """Finishers with position and official SP. Returns (entries, is_handicap)."""
+    soup = BeautifulSoup(html, "html.parser")
+    entries = []
+    for name, n, text in horse_rows(soup):
+        m = ORD_RE.match(text)
+        pos = int(m.group(1)) if m else (99 if STATUS_RE.match(text) else None)
+        sp = SP_RE.search(text)
+        odds, dec = parse_odds(sp.group(1)) if sp else (None, None)
+        entries.append({"name": name, "norm": n, "odds": odds, "dec": dec,
+                        "nr": False, "pos": pos, "status": pos == 99})
     title = clean(soup.title.get_text()) if soup.title else ""
     h1 = soup.find("h1")
-    head = (title + " " + (clean(h1.get_text()) if h1 else "")).lower()
-    return entries, ("handicap" in head or "hcap" in head)
+    head = title + " " + (clean(h1.get_text()) if h1 else "")
+    return entries, bool(HCAP_RE.search(head))
 
 
 # ----------------------------------------------------------------------------
@@ -266,6 +330,8 @@ def scrape_day(day, now, warnings):
     idx = [f"{BASE}/racecards/{fmt_date(day)}"]
     if day == today:
         idx.append(f"{BASE}/racecards")
+    elif day == today + dt.timedelta(days=1):
+        idx.append(f"{BASE}/racecards/tomorrow")
     links = discover(idx, day)
     log(f"Found {len(links)} race links for {day}")
     races, runners, per_meeting = [], [], defaultdict(lambda: [0, 0])
@@ -280,8 +346,7 @@ def scrape_day(day, now, warnings):
         if not html:
             warnings.append(f"fetch failed {course} {hhmm}")
             continue
-        entries, _ = parse_rows(html)
-        entries = [e for e in entries if not e["nr"]]
+        entries = [e for e in parse_racecard(html) if not e["nr"]]
         priced = [e for e in entries if e["dec"]]
         per_meeting[course][0] += 1
         per_meeting[course][1] += len(priced)
@@ -385,8 +450,8 @@ TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pic
 
 
 def settle_row(row, finishers, handicap, now):
-    """Fill result columns on a tracker row. finishers = parse_rows() entries in finish order."""
-    runners = [e for e in finishers if not e["nr"]]
+    """Fill result columns on a tracker row. finishers = parse_result() entries in page order."""
+    runners = [e for e in finishers if not e.get("nr")]
     names = [e["norm"] for e in runners]
     target = norm(row["horse"])
     if target not in names:
@@ -395,7 +460,7 @@ def settle_row(row, finishers, handicap, now):
     i = names.index(target)
     e = runners[i]
     field = len(runners)
-    pos = 99 if e["status"] else i + 1
+    pos = e["pos"] if e.get("pos") is not None else i + 1
     places, frac = place_terms(field, handicap)
     sp_dec = e["dec"] or to_float(row.get("dec_at_pick"), 2.0)
     won = pos == 1
@@ -412,16 +477,13 @@ def settle_row(row, finishers, handicap, now):
 
 
 def fetch_results_for(day, needed):
-    """needed = set of (norm course, hhmm). Returns {(norm course, hhmm): (entries, handicap)}."""
-    links = discover([f"{BASE}/results/{fmt_date(day)}"], day)
+    """needed = {(norm course, hhmm): course}. Returns {(norm course, hhmm): (entries, handicap)}."""
     out = {}
-    for (course, hhmm), url in links.items():
-        k = (norm(course), hhmm)
-        if k not in needed:
-            continue
+    for (ncourse, hhmm), course in needed.items():
+        url = f"{BASE}/raceresults/{fmt_date(day)}/{course.replace(' ', '-')}/{hhmm}"
         html = get(url)
         if html:
-            out[k] = parse_rows(html)
+            out[(ncourse, hhmm)] = parse_result(html)
     return out
 
 
@@ -438,7 +500,7 @@ def settle_all(rows, now, warnings):
         due = [r for r in group if now >= race_off(day, r["time"]) + dt.timedelta(minutes=25)]
         if not due:
             continue
-        needed = {(norm(r["course"]), r["time"]) for r in due}
+        needed = {(norm(r["course"]), r["time"]): r["course"] for r in due}
         results = fetch_results_for(day, needed)
         for r in due:
             res = results.get((norm(r["course"]), r["time"]))
@@ -447,8 +509,8 @@ def settle_all(rows, now, warnings):
                     r["status"] = "NO_RESULT"
                 continue
             entries, handicap = res
-            if len(entries) < 2:
-                warnings.append(f"result page empty: {r['course']} {r['time']}")
+            if len(entries) < 2 or not any(e["pos"] is not None or e["dec"] for e in entries):
+                warnings.append(f"no result yet / not parsed: {r['course']} {r['time']}")
                 continue
             settle_row(r, entries, handicap, now)
 
