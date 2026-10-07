@@ -8,7 +8,9 @@ What it does each run
   2. Scrapes ALL UK/IRE meetings for the target day (today, or tomorrow after 22:00 Dublin).
   3. Logs a price snapshot, then works out market movers against earlier snapshots.
   4. Scores runners, picks BETS_TO_PLACE across all meetings, logs them in BET_TRACKER.
-  5. Rewrites the summary tabs, including TRACKER_SUMMARY (win % / place % / ROI).
+  5. Picks the single best selection in EVERY race (BEST_PER_RACE), re-picking until the off,
+     then tracks and settles those too (RACE_BEST_TRACKER / RACE_BEST_SUMMARY).
+  6. Rewrites the summary tabs, including TRACKER_SUMMARY (win % / place % / ROI).
 
 Environment variables
   GOOGLE_CREDS    full service-account JSON (or put credentials.json next to this file)
@@ -440,6 +442,41 @@ def choose_bets(runners):
     return sorted(picks, key=lambda x: (x["time"], x["course"]))
 
 
+def choose_best_per_race(runners):
+    """Highest value_edge runner in every race (no threshold); needs 3+ priced runners."""
+    races = defaultdict(list)
+    for r in runners:
+        races[(r["date"], r["course"], r["time"])].append(r)
+    picks = []
+    for field in races.values():
+        if len(field) >= 3:
+            picks.append(max(field, key=lambda x: (x["value_edge"], -x["dec"])))
+    return sorted(picks, key=lambda x: (x["date"], x["time"], x["course"]))
+
+
+def upsert_race_bests(rows, picks):
+    """One row per race. A PENDING row is re-picked on each run until the race is off
+    (the scrape only sees races still to run); settled or started races are left alone."""
+    by_key = {r["key"]: r for r in rows}
+    added = 0
+    for b in picks:
+        key = f"{b['date']}|{norm(b['course'])}|{b['time']}"
+        vals = {"odds_at_pick": b["odds"], "dec_at_pick": b["dec"], "horse": b["horse"],
+                "model_prob": round(b["model_prob"], 4), "value_edge": round(b["value_edge"], 4),
+                "region": b["region"]}
+        row = by_key.get(key)
+        if row is None:
+            row = {**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
+                   "course": b["course"], "time": b["time"], "status": "PENDING"}
+            row.update(vals)
+            rows.append(row)
+            by_key[key] = row
+            added += 1
+        elif row.get("status") == "PENDING":
+            row.update(vals)
+    return added
+
+
 # ----------------------------------------------------------------------------
 # Bet tracker: settle from results, summarise
 # ----------------------------------------------------------------------------
@@ -476,14 +513,20 @@ def settle_row(row, finishers, handicap, now):
     })
 
 
+_RES_CACHE = {}
+
+
 def fetch_results_for(day, needed):
     """needed = {(norm course, hhmm): course}. Returns {(norm course, hhmm): (entries, handicap)}."""
     out = {}
     for (ncourse, hhmm), course in needed.items():
-        url = f"{BASE}/raceresults/{fmt_date(day)}/{course.replace(' ', '-')}/{hhmm}"
-        html = get(url)
-        if html:
-            out[(ncourse, hhmm)] = parse_result(html)
+        ck = (day.isoformat(), ncourse, hhmm)
+        if ck not in _RES_CACHE:
+            url = f"{BASE}/raceresults/{fmt_date(day)}/{course.replace(' ', '-')}/{hhmm}"
+            html = get(url)
+            _RES_CACHE[ck] = parse_result(html) if html else None
+        if _RES_CACHE[ck] is not None:
+            out[(ncourse, hhmm)] = _RES_CACHE[ck]
     return out
 
 
@@ -607,8 +650,8 @@ def append_rows(sh, name, header, rows):
     ws.append_rows([[cell(c) for c in r] for r in rows])
 
 
-def load_tracker(sh):
-    ws = get_tab(sh, "BET_TRACKER")
+def load_tracker(sh, tab="BET_TRACKER"):
+    ws = get_tab(sh, tab)
     vals = ws.get_all_values()
     if not vals:
         return []
@@ -623,8 +666,8 @@ def load_tracker(sh):
     return rows
 
 
-def save_tracker(sh, rows):
-    write_tab(sh, "BET_TRACKER", TRACKER_COLS, [[r.get(c, "") for c in TRACKER_COLS] for r in rows])
+def save_tracker(sh, rows, tab="BET_TRACKER"):
+    write_tab(sh, tab, TRACKER_COLS, [[r.get(c, "") for c in TRACKER_COLS] for r in rows])
 
 
 def load_snapshots(sh, day):
@@ -667,6 +710,8 @@ def main():
     # 1. settle old bets first so results are never lost
     tracker = load_tracker(sh)
     settle_all(tracker, now, warnings)
+    race_best = load_tracker(sh, "RACE_BEST_TRACKER")
+    settle_all(race_best, now, warnings)
 
     # 2. scrape target day
     races, runners, per_meeting = scrape_day(day, now, warnings)
@@ -695,6 +740,10 @@ def main():
                         "value_edge": round(b["value_edge"], 4), "status": "PENDING"})
         new_bets += 1
     save_tracker(sh, tracker)
+
+    picks = choose_best_per_race(runners)
+    new_race_bests = upsert_race_bests(race_best, picks)
+    save_tracker(sh, race_best, "RACE_BEST_TRACKER")
 
     # 5. write tabs
     r_head = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
@@ -740,6 +789,20 @@ def main():
     head, srows = summarise(tracker)
     write_tab(sh, "TRACKER_SUMMARY", head, srows)
 
+    recent = (day - dt.timedelta(days=1)).isoformat()
+    card = sorted((r for r in race_best if r["date"] >= recent),
+                  key=lambda r: (r["date"], r["time"], r["course"]))
+    write_tab(sh, "BEST_PER_RACE",
+              ["date", "time", "course", "region", "horse", "odds", "model_prob", "value_edge",
+               "status", "position", "field_size", "sp", "won", "placed",
+               "pnl_win_units", "pnl_place_units"],
+              [[r["date"], r["time"], r["course"], r["region"], r["horse"], r["odds_at_pick"],
+                r["model_prob"], r["value_edge"], r["status"], r["position"], r["field_size"],
+                r["sp"], r["won"], r["placed"], r["pnl_win_units"], r["pnl_place_units"]]
+               for r in card])
+    rhead, rrows = summarise(race_best)
+    write_tab(sh, "RACE_BEST_SUMMARY", rhead, rrows)
+
     # 6. dashboard + log
     if not runners:
         status = "NO RUNNERS PARSED"
@@ -752,7 +815,11 @@ def main():
             ["runners_with_2h_ref", n2h], ["runners_with_night_ref", nnight],
             ["pending_bets", sum(1 for r in tracker if r["status"] == "PENDING")],
             ["settled_bets", sum(1 for r in tracker if r["status"] == "SETTLED")],
-            ["unmatched_bets", sum(1 for r in tracker if r["status"] == "UNMATCHED")], []]
+            ["unmatched_bets", sum(1 for r in tracker if r["status"] == "UNMATCHED")],
+            ["race_best_picks_today", len(picks)], ["race_best_new", new_race_bests],
+            ["race_best_pending", sum(1 for r in race_best if r["status"] == "PENDING")],
+            ["race_best_settled", sum(1 for r in race_best if r["status"] == "SETTLED")],
+            ["race_best_unmatched", sum(1 for r in race_best if r["status"] == "UNMATCHED")], []]
     for course, (nr, nrun) in sorted(per_meeting.items()):
         dash.append([f"meeting: {course}", f"{nr} races, {nrun} priced runners"])
     for w in warnings[:40]:
