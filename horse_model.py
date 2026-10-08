@@ -19,10 +19,13 @@ Environment variables
   MIN_VALUE_EDGE  default 0.02
   MAX_BETS        max bets in BETS_TO_PLACE, default 12
   MAX_PER_MEETING max bets from one meeting, default 3
+  MAX_FIELD_HCAP  handicaps with this many runners or more are flagged / skipped, default 16
+  STRICT_FILTERS  1 (default) = BETS_TO_PLACE skips flagged races and horses with <2 prior runs
   DEBUG_DUMP      set to 1 to save fetched pages into ./debug (uploaded by the workflow)
 """
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
@@ -44,9 +47,14 @@ REGION = (os.environ.get("REGION") or "all").strip().lower()
 MIN_EDGE = float(os.environ.get("MIN_VALUE_EDGE") or 0.02)
 MAX_BETS = int(os.environ.get("MAX_BETS") or 12)
 MAX_PER_MEETING = int(os.environ.get("MAX_PER_MEETING") or 3)
+BIG_FIELD = int(os.environ.get("MAX_FIELD_HCAP") or 16)
+STRICT = (os.environ.get("STRICT_FILTERS") or "1") != "0"
 DEBUG = os.environ.get("DEBUG_DUMP") == "1"
 
 MIN_DEC, MAX_DEC = 1.8, 13.0       # price window for selections (decimal odds)
+# Starting weights for the form model (logit units). Guesses, to be tuned from the tracker.
+W = {"market": 1.1, "form": 0.7, "rating": 0.20, "trainer": 0.12, "jockey": 0.08,
+     "cd": 0.15, "layoff": 0.15, "move": 0.8}
 MOVER_MIN_AGE_MIN = 20             # a snapshot must be at least this old to be a reference
 MOVER_SHOW_PCT = 5.0               # show movers of at least this size
 REQUEST_PAUSE = 0.4                # seconds between page requests
@@ -206,6 +214,12 @@ ORD_RE = re.compile(r"^\s*(\d{1,2})(?:st|nd|rd|th)\b")
 STATUS_RE = re.compile(r"^\s*(PU|UR|BD|F|RO|SU|DSQ|REF|CO|LFT|DNF|VOID)\b")
 SP_RE = re.compile(r"\bSP\s+(\d{1,3}\s*/\s*\d{1,3}|evens|evs)", re.I)
 HCAP_RE = re.compile(r"h['\u2019]?cap|handicap", re.I)
+RUN_DATE_RE = re.compile(r"(\d{1,2})(?:st|nd|rd|th)\s+([A-Z][a-z]{2})\s+(\d{2})\b")
+RUN_POS_RE = re.compile(r"\b([A-Za-z0-9]{1,4})\s+of\s+(\d{1,2})\s+runners")
+RATED_RE = re.compile(r"Rated\s+(\d{2,3})")
+DECLARED_RE = re.compile(r"(\d{1,2})\s+Declared", re.I)
+SYMBOLS_RE = re.compile(r"\((\d{1,3})\)\s*((?:(?:cd|c|d|bf)(?=[\d\s(]|$)\d*\s*)*)")
+MON_IDX = {m: i + 1 for i, m in enumerate(MON3)}
 
 
 def discover(index_urls, day):
@@ -241,8 +255,8 @@ def row_for(a):
     return row
 
 
-def horse_rows(soup):
-    """[(name, norm, row_text)] for each distinct horse link, in page order."""
+def horse_blocks(soup):
+    """[{name, norm, text, row}] for each distinct horse link, in page order."""
     for root in (soup.find("main"), soup):
         if root is None:
             continue
@@ -254,10 +268,16 @@ def horse_rows(soup):
                 continue
             seen.add(n)
             row = row_for(a)
-            out.append((name, n, clean(row.get_text(" ", strip=True)) if row else ""))
+            out.append({"name": name, "norm": n, "row": row,
+                        "text": clean(row.get_text(" ", strip=True)) if row else ""})
         if out:
             return out
     return []
+
+
+def horse_rows(soup):
+    """[(name, norm, row_text)] for each distinct horse link, in page order."""
+    return [(b["name"], b["norm"], b["text"]) for b in horse_blocks(soup)]
 
 
 def parse_probable_sp(soup):
@@ -291,16 +311,114 @@ def parse_probable_sp(soup):
     return prices
 
 
-def parse_racecard(html):
-    """Runners in card order, priced from the page's Probable SP line."""
+def person_key(s):
+    return norm(re.sub(r"\(\d+\)", "", s or ""))
+
+
+def smooth_rate(wins, runs, prior=0.10, k=20):
+    return (wins + prior * k) / (runs + k)
+
+
+def parse_in_form(lines, heading, end):
+    """Read a 'Trainers/Jockeys In Form last 21 days' table from page text lines
+    -> {person_key: (wins, runs)}."""
+    out, name, nums, on = {}, None, [], False
+    for ln in lines:
+        if not on:
+            on = bool(re.match(heading, ln, re.I))
+            continue
+        if re.search(end, ln, re.I):
+            break
+        if re.fullmatch(r"\d+", ln):
+            nums.append(int(ln))
+            if len(nums) == 3 and name:
+                out[person_key(name)] = (nums[0], nums[1])
+                name, nums = None, []
+        elif ln not in ("Trainer", "Jockey", "Wins", "Runs", "%", "Trainer/Jockey"):
+            name, nums = ln, []
+    return out
+
+
+def layoff_term(days):
+    if days is None:
+        return 0.0
+    return -1.0 if days > 90 else (-0.5 if days > 45 else 0.0)
+
+
+def runner_features(text, race_day):
+    """Rating, recent-form score, days since last run and course/distance record
+    from one runner's block of racecard text."""
+    pre, _, rest = text.partition("Last Three Runs")
+    section = rest.split("Head to Head", 1)[0]
+    f = {"rating": None, "form_score": None, "runs_n": 0, "days_off": None, "cd": 0.0}
+    m = RATED_RE.search(pre)
+    if m:
+        f["rating"] = int(m.group(1))
+    sm = SYMBOLS_RE.search(pre)
+    if sm:
+        toks = [re.sub(r"\d", "", t) for t in sm.group(2).split()]
+        if "cd" in toks:
+            f["cd"] = 1.0
+        elif "c" in toks or "d" in toks:
+            f["cd"] = 0.5
+    anchors = list(RUN_DATE_RE.finditer(section))
+    f["runs_n"] = len(anchors)
+    pcts = []
+    for i, a in enumerate(anchors):
+        if i == 0 and race_day is not None and a.group(2) in MON_IDX:
+            try:
+                last = dt.date(2000 + int(a.group(3)), MON_IDX[a.group(2)], int(a.group(1)))
+                d = (race_day - last).days
+                f["days_off"] = d if d >= 0 else None
+            except ValueError:
+                pass
+        end = anchors[i + 1].start() if i + 1 < len(anchors) else len(section)
+        pm = RUN_POS_RE.search(section[a.end():end])
+        if not pm:
+            continue
+        om = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th)", pm.group(1))
+        if om:
+            field = int(pm.group(2))
+            pcts.append(1.0 - (int(om.group(1)) - 1) / max(field - 1, 1))
+        else:
+            pcts.append(0.1)                      # pulled up / fell / unseated etc.
+    if pcts:
+        w = [0.5, 0.3, 0.2][:len(pcts)]
+        f["form_score"] = sum(x * y for x, y in zip(pcts, w)) / sum(w)
+    return f
+
+
+def parse_racecard(html, race_day=None):
+    """Runners in card order, priced from the Probable SP line, with form features.
+    Returns (entries, race_info)."""
     soup = BeautifulSoup(html, "html.parser")
     prices = parse_probable_sp(soup)
+    lines = [clean(x) for x in soup.get_text("\n", strip=True).split("\n")]
+    trainers = parse_in_form(lines, r"Trainers In Form", r"For Trainers in this race")
+    jockeys = parse_in_form(lines, r"Jockeys In Form", r"For Jockeys in this race")
     entries = []
-    for name, n, _ in horse_rows(soup):
-        odds, dec = parse_odds(prices.get(n, ""))
-        entries.append({"name": name, "norm": n, "odds": odds, "dec": dec,
-                        "nr": False, "pos": None, "status": False})
-    return entries
+    for b in horse_blocks(soup):
+        odds, dec = parse_odds(prices.get(b["norm"], ""))
+        f = runner_features(b["text"], race_day)
+        row = b["row"]
+        ta = row.find("a", href=re.compile(r"/trainer/", re.I)) if row else None
+        ja = row.find("a", href=re.compile(r"/jockey/", re.I)) if row else None
+        tname = clean(ta.get_text(" ", strip=True)) if ta else ""
+        jname = clean(ja.get_text(" ", strip=True)) if ja else ""
+        tw = trainers.get(person_key(tname))
+        jw = jockeys.get(person_key(jname))
+        entries.append({
+            "name": b["name"], "norm": b["norm"], "odds": odds, "dec": dec,
+            "nr": False, "pos": None, "status": False,
+            "trainer": tname, "jockey": jname,
+            "trainer_rate": smooth_rate(*tw) if tw else None,
+            "jockey_rate": smooth_rate(*jw) if jw else None, **f})
+    title = clean(soup.title.get_text()) if soup.title else ""
+    h1 = soup.find("h1")
+    head = title + " " + (clean(h1.get_text()) if h1 else "")
+    dm = DECLARED_RE.search(soup.get_text(" ", strip=True))
+    declared = int(dm.group(1)) if dm else len(entries)
+    return entries, {"handicap": bool(HCAP_RE.search(head)), "declared": declared}
 
 
 def parse_result(html):
@@ -350,19 +468,35 @@ def scrape_day(day, now, warnings):
         if not html:
             warnings.append(f"fetch failed {course} {hhmm}")
             continue
-        entries = [e for e in parse_racecard(html) if not e["nr"]]
+        entries, rinfo = parse_racecard(html, day)
+        entries = [e for e in entries if not e["nr"]]
         priced = [e for e in entries if e["dec"]]
         per_meeting[course][0] += 1
         per_meeting[course][1] += len(priced)
+        declared = rinfo["declared"] or len(entries)
+        conf = (sum(1 for e in entries if e["runs_n"] >= 2) / len(entries)) if entries else 0.0
+        flags = []
+        if rinfo["handicap"] and declared >= BIG_FIELD:
+            flags.append("BIG-FIELD HCAP")
+        if entries and conf < 0.7:
+            flags.append("MANY UNRACED")
+        flag = " + ".join(flags)
         races.append({"date": day.isoformat(), "course": course, "region": region,
-                      "time": hhmm, "url": url, "runners": len(entries), "priced": len(priced)})
+                      "time": hhmm, "url": url, "runners": len(entries), "priced": len(priced),
+                      "handicap": rinfo["handicap"], "declared": declared,
+                      "confidence": round(conf, 2), "flag": flag})
         if len(priced) < 2:
             warnings.append(f"{course} {hhmm}: only {len(priced)} priced runners parsed")
             continue
         for e in priced:
             runners.append({"date": day.isoformat(), "course": course, "region": region,
                             "time": hhmm, "off": off, "horse": e["name"], "norm": e["norm"],
-                            "odds": e["odds"], "dec": e["dec"]})
+                            "odds": e["odds"], "dec": e["dec"], "flag": flag,
+                            "confidence": round(conf, 2), "rating": e["rating"],
+                            "form_score": e["form_score"], "runs_n": e["runs_n"],
+                            "days_off": e["days_off"], "cd": e["cd"],
+                            "trainer": e["trainer"], "jockey": e["jockey"],
+                            "trainer_rate": e["trainer_rate"], "jockey_rate": e["jockey_rate"]})
     return races, runners, per_meeting, info
 
 
@@ -402,7 +536,22 @@ def add_movers(runners, snaps, now):
 # ----------------------------------------------------------------------------
 # Model (simple, market based placeholder: swap in your own scoring here)
 # ----------------------------------------------------------------------------
+def centered(vals):
+    """Subtract the race average (of runners that have data); missing data counts as average."""
+    known = [v for v in vals if v is not None]
+    if len(known) < 2:
+        return [0.0] * len(vals)
+    m = sum(known) / len(known)
+    return [(v - m) if v is not None else 0.0 for v in vals]
+
+
+def clip(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
 def add_model(runners):
+    """Market probability (bias corrected) nudged by form, rating, trainer/jockey form,
+    course/distance record, time off and price moves, then renormalised per race."""
     by_race = defaultdict(list)
     for r in runners:
         by_race[(r["date"], r["course"], r["time"])].append(r)
@@ -410,26 +559,46 @@ def add_model(runners):
         raw = [1.0 / r["dec"] for r in field]
         tot = sum(raw)
         fair = [p / tot for p in raw]
-        adj = [p ** 1.1 for p in fair]              # favourite / longshot bias correction
-        for r, f, a in zip(field, fair, adj):
+        forms = centered([r.get("form_score") for r in field])
+        ratings = centered([r.get("rating") for r in field])
+        trates = centered([r.get("trainer_rate") for r in field])
+        jrates = centered([r.get("jockey_rate") for r in field])
+        logits = []
+        for r, f, fc, rc, tc, jc in zip(field, fair, forms, ratings, trates, jrates):
             move = r.get("mover_night_pct")
             if move is None:
                 move = r.get("mover_2h_pct")
-            bonus = min(0.03, max(0.0, -(move or 0.0)) / 100 * 0.15)   # shortening = support
-            r["fair_prob"], r["_adj"] = f, a + bonus
-        s = sum(r["_adj"] for r in field)
-        for r in field:
-            r["model_prob"] = r.pop("_adj") / s
+            short = min(0.3, max(0.0, -(move or 0.0)) / 100)
+            terms = {
+                "form": W["form"] * fc,
+                "rating": W["rating"] * clip(rc / 10, -3, 3),
+                "trainer": W["trainer"] * clip(tc / 0.10, -2, 2),
+                "jockey": W["jockey"] * clip(jc / 0.10, -2, 2),
+                "c&d": W["cd"] * (r.get("cd") or 0.0),
+                "layoff": W["layoff"] * layoff_term(r.get("days_off")),
+                "move": W["move"] * short,
+            }
+            r["fair_prob"], r["_terms"] = f, terms
+            logits.append(W["market"] * math.log(f) + sum(terms.values()))
+        mx = max(logits)
+        ex = [math.exp(x - mx) for x in logits]
+        s = sum(ex)
+        for r, e in zip(field, ex):
+            r["model_prob"] = e / s
             r["value_edge"] = r["model_prob"] - r["fair_prob"]
             r["ev"] = r["model_prob"] * r["dec"] - 1
             r["shorten_score"] = round(max(0.0, -(r.get("mover_2h_pct") or 0.0))
                                        + 0.5 * max(0.0, -(r.get("mover_night_pct") or 0.0)), 1)
+            top = sorted(r.pop("_terms").items(), key=lambda kv: -kv[1])[:2]
+            r["reason"] = ", ".join(f"{k} {v:+.2f}" for k, v in top if v >= 0.03)
 
 
 def choose_bets(runners):
     best = {}
     for r in runners:
         if r["value_edge"] >= MIN_EDGE and MIN_DEC <= r["dec"] <= MAX_DEC:
+            if STRICT and (r.get("flag") or (r.get("runs_n") or 0) < 2):
+                continue                                # big-field handicaps, unraced fields, debutants
             k = (r["date"], r["course"], r["time"])
             if k not in best or r["value_edge"] > best[k]["value_edge"]:
                 best[k] = r                             # one selection per race
@@ -444,15 +613,24 @@ def choose_bets(runners):
     return sorted(picks, key=lambda x: (x["time"], x["course"]))
 
 
-def choose_best_per_race(runners):
-    """Highest value_edge runner in every race (no threshold); needs 3+ priced runners."""
+def _by_race(runners):
     races = defaultdict(list)
     for r in runners:
         races[(r["date"], r["course"], r["time"])].append(r)
-    picks = []
-    for field in races.values():
-        if len(field) >= 3:
-            picks.append(max(field, key=lambda x: (x["value_edge"], -x["dec"])))
+    return races
+
+
+def choose_best_per_race(runners):
+    """Highest value_edge runner in every race (no threshold); needs 3+ priced runners."""
+    picks = [max(f, key=lambda x: (x["value_edge"], -x["dec"]))
+             for f in _by_race(runners).values() if len(f) >= 3]
+    return sorted(picks, key=lambda x: (x["date"], x["time"], x["course"]))
+
+
+def choose_favourite_per_race(runners):
+    """Shortest-priced runner in every race: the baseline the picks have to beat."""
+    picks = [min(f, key=lambda x: (x["dec"], x["horse"]))
+             for f in _by_race(runners).values() if len(f) >= 3]
     return sorted(picks, key=lambda x: (x["date"], x["time"], x["course"]))
 
 
@@ -462,6 +640,15 @@ def card_order(r):
     return (-d, r["course"], r["time"])
 
 
+def pick_fields(b):
+    fs = b.get("form_score")
+    return {"odds_at_pick": b["odds"], "dec_at_pick": b["dec"], "horse": b["horse"],
+            "model_prob": round(b["model_prob"], 4), "value_edge": round(b["value_edge"], 4),
+            "region": b["region"], "form_score": round(fs, 2) if fs is not None else "",
+            "confidence": b.get("confidence", ""), "reason": b.get("reason", ""),
+            "race_flag": b.get("flag", "")}
+
+
 def upsert_race_bests(rows, picks):
     """One row per race. A PENDING row is re-picked on each run until the race is off
     (the scrape only sees races still to run); settled or started races are left alone."""
@@ -469,9 +656,7 @@ def upsert_race_bests(rows, picks):
     added = 0
     for b in picks:
         key = f"{b['date']}|{norm(b['course'])}|{b['time']}"
-        vals = {"odds_at_pick": b["odds"], "dec_at_pick": b["dec"], "horse": b["horse"],
-                "model_prob": round(b["model_prob"], 4), "value_edge": round(b["value_edge"], 4),
-                "region": b["region"]}
+        vals = pick_fields(b)
         row = by_key.get(key)
         if row is None:
             row = {**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
@@ -491,7 +676,8 @@ def upsert_race_bests(rows, picks):
 TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pick",
                 "dec_at_pick", "model_prob", "value_edge", "status", "position",
                 "field_size", "places_paid", "sp", "sp_dec", "won", "placed",
-                "pnl_win_units", "pnl_place_units", "settled_at"]
+                "pnl_win_units", "pnl_place_units", "settled_at",
+                "form_score", "confidence", "reason", "race_flag", "clv_pct"]
 
 
 def settle_row(row, finishers, handicap, now):
@@ -511,7 +697,9 @@ def settle_row(row, finishers, handicap, now):
     won = pos == 1
     placed = pos <= places
     place_odds = (sp_dec - 1) * frac + 1
-    row.update({
+    pick_dec = to_float(row.get("dec_at_pick"))
+    clv = round((pick_dec / sp_dec - 1) * 100, 1) if pick_dec and sp_dec else ""
+    row.update({"clv_pct": clv,
         "status": "SETTLED", "position": pos if pos != 99 else "DNF", "field_size": field,
         "places_paid": places, "sp": e["odds"] or "", "sp_dec": round(sp_dec, 3),
         "won": 1 if won else 0, "placed": 1 if placed else 0,
@@ -573,38 +761,56 @@ def band(x, cuts, labels):
     return labels[-1]
 
 
-def summarise(rows):
+def race_key(r):
+    return f"{r['date']}|{norm(r['course'])}|{r['time']}"
+
+
+SUM_HEAD = ["Segment", "Bets", "Wins", "Win %", "Places", "Place %",
+            "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %", "Avg CLV %"]
+
+
+def stats_row(name, g):
+    n = len(g)
+    if n == 0:
+        return [name, 0, 0, "", 0, "", 0, "", 0, "", ""]
+    w = sum(int(to_float(r["won"], 0)) for r in g)
+    p = sum(int(to_float(r["placed"], 0)) for r in g)
+    wp = sum(to_float(r["pnl_win_units"], 0) for r in g)
+    pp = sum(to_float(r["pnl_place_units"], 0) for r in g)
+    clvs = [c for c in (to_float(r.get("clv_pct")) for r in g) if c is not None]
+    return [name, n, w, round(w / n * 100, 1), p, round(p / n * 100, 1),
+            round(wp, 2), round(wp / n * 100, 1), round(pp, 2), round(pp / n * 100, 1),
+            round(sum(clvs) / len(clvs), 1) if clvs else ""]
+
+
+def summarise(rows, fav_rows=None):
+    """Win/place/ROI/CLV by segment. With fav_rows, adds a 'favourite in the same races' baseline."""
     settled = [r for r in rows if r.get("status") == "SETTLED"]
     groups = {"ALL BETS": settled}
     for r in settled:
         edge = to_float(r.get("value_edge"), 0)
         dec = to_float(r.get("sp_dec"), 0)
         groups.setdefault("Region: " + str(r["region"]), []).append(r)
-        groups.setdefault("Edge " + band(edge, [0.03, 0.05], ["2-3%", "3-5%", "5%+"]), []).append(r)
+        groups.setdefault("Edge " + band(edge, [0.03, 0.05], ["<3%", "3-5%", "5%+"]), []).append(r)
         groups.setdefault("Odds " + band(dec, [2.5, 5, 10], ["<1.5/1", "1.5/1-4/1", "4/1-9/1", "9/1+"]), []).append(r)
         fs = to_float(r.get("field_size"), 0)
         groups.setdefault("Field " + band(fs, [8, 13], ["<8", "8-12", "13+"]), []).append(r)
-    header = ["Segment", "Bets", "Wins", "Win %", "Places", "Place %",
-              "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %"]
-    out = []
-    for name in sorted(groups, key=lambda s: (s != "ALL BETS", s)):
-        g = groups[name]
-        n = len(g)
-        if n == 0:
-            out.append([name, 0, 0, "", 0, "", 0, "", 0, ""])
-            continue
-        w = sum(int(to_float(r["won"], 0)) for r in g)
-        p = sum(int(to_float(r["placed"], 0)) for r in g)
-        wp = sum(to_float(r["pnl_win_units"], 0) for r in g)
-        pp = sum(to_float(r["pnl_place_units"], 0) for r in g)
-        out.append([name, n, w, round(w / n * 100, 1), p, round(p / n * 100, 1),
-                    round(wp, 2), round(wp / n * 100, 1), round(pp, 2), round(pp / n * 100, 1)])
+        groups.setdefault("Race " + ("flagged" if r.get("race_flag") else "OK"), []).append(r)
+        clv = to_float(r.get("clv_pct"))
+        if clv is not None:
+            groups.setdefault("Price " + ("shortened (CLV+)" if clv > 0 else "drifted (CLV-)"), []).append(r)
+    out = [stats_row(name, groups[name])
+           for name in sorted(groups, key=lambda s: (s != "ALL BETS", s))]
+    if fav_rows is not None:
+        keys = {race_key(r) for r in settled}
+        base = [f for f in fav_rows if f.get("status") == "SETTLED" and race_key(f) in keys]
+        out.insert(1, stats_row("BASELINE: favourite, same races", base))
     counts = defaultdict(int)
     for r in rows:
         counts[r.get("status", "")] += 1
     out.append([])
     out.append(["Status counts: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))])
-    return header, out
+    return SUM_HEAD, out
 
 
 # ----------------------------------------------------------------------------
@@ -741,6 +947,8 @@ def main():
     settle_all(tracker, now, warnings)
     race_best = load_tracker(sh, "RACE_BEST_TRACKER")
     settle_all(race_best, now, warnings)
+    fav_best = load_tracker(sh, "FAV_BASELINE_TRACKER")
+    settle_all(fav_best, now, warnings)
 
     # 2. scrape target day
     races, runners, per_meeting, info = scrape_day(day, now, warnings)
@@ -769,25 +977,28 @@ def main():
         if key in known:
             continue
         tracker.append({**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
-                        "course": b["course"], "time": b["time"], "region": b["region"],
-                        "horse": b["horse"], "odds_at_pick": b["odds"], "dec_at_pick": b["dec"],
-                        "model_prob": round(b["model_prob"], 4),
-                        "value_edge": round(b["value_edge"], 4), "status": "PENDING"})
+                        "course": b["course"], "time": b["time"], "status": "PENDING",
+                        **pick_fields(b)})
         new_bets += 1
     save_tracker(sh, tracker)
 
     picks = choose_best_per_race(runners)
     new_race_bests = upsert_race_bests(race_best, picks)
     save_tracker(sh, race_best, "RACE_BEST_TRACKER")
+    upsert_race_bests(fav_best, choose_favourite_per_race(runners))
+    save_tracker(sh, fav_best, "FAV_BASELINE_TRACKER")
 
     # 5. write tabs
     r_head = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
-              "value_edge", "ev", "mover_2h_pct", "mover_night_pct"]
+              "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
+              "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason"]
 
     def rr(r):
         return [r["date"], r["course"], r["region"], r["time"], r["horse"], r["odds"], r["dec"],
                 r["fair_prob"], r["model_prob"], r["value_edge"], r["ev"],
-                r["mover_2h_pct"], r["mover_night_pct"]]
+                r["mover_2h_pct"], r["mover_night_pct"], r.get("form_score"), r.get("rating"),
+                r.get("days_off"), r.get("trainer_rate"), r.get("jockey_rate"),
+                r.get("confidence"), r.get("flag"), r.get("reason")]
 
     if runners:
         write_tab(sh, "RUNNERS_TARGET", r_head, [rr(r) for r in runners])
@@ -821,20 +1032,21 @@ def main():
         write_tab(sh, tab, m_head, rows)
 
     write_tab(sh, "TARGET_DAY", ["target_day", "generated"], [[day.isoformat(), stamp]])
-    head, srows = summarise(tracker)
+    head, srows = summarise(tracker, fav_best)
     write_tab(sh, "TRACKER_SUMMARY", head, srows)
 
     recent = (day - dt.timedelta(days=1)).isoformat()
     card = sorted((r for r in race_best if r["date"] >= recent), key=card_order)
     write_tab(sh, "BEST_PER_RACE",
               ["date", "time", "course", "region", "horse", "odds", "model_prob", "value_edge",
-               "status", "position", "field_size", "sp", "won", "placed",
-               "pnl_win_units", "pnl_place_units"],
+               "form_score", "confidence", "reason", "race_flag", "status", "position",
+               "field_size", "sp", "clv_pct", "won", "placed", "pnl_win_units", "pnl_place_units"],
               [[r["date"], r["time"], r["course"], r["region"], r["horse"], r["odds_at_pick"],
-                r["model_prob"], r["value_edge"], r["status"], r["position"], r["field_size"],
-                r["sp"], r["won"], r["placed"], r["pnl_win_units"], r["pnl_place_units"]]
+                r["model_prob"], r["value_edge"], r["form_score"], r["confidence"], r["reason"],
+                r["race_flag"], r["status"], r["position"], r["field_size"], r["sp"],
+                r["clv_pct"], r["won"], r["placed"], r["pnl_win_units"], r["pnl_place_units"]]
                for r in card])
-    rhead, rrows = summarise(race_best)
+    rhead, rrows = summarise(race_best, fav_best)
     write_tab(sh, "RACE_BEST_SUMMARY", rhead, rrows)
 
     # 6. dashboard + log
@@ -867,7 +1079,15 @@ def main():
             ["race_best_picks_today", len(picks)], ["race_best_new", new_race_bests],
             ["race_best_pending", sum(1 for r in race_best if r["status"] == "PENDING")],
             ["race_best_settled", sum(1 for r in race_best if r["status"] == "SETTLED")],
-            ["race_best_unmatched", sum(1 for r in race_best if r["status"] == "UNMATCHED")], []]
+            ["race_best_unmatched", sum(1 for r in race_best if r["status"] == "UNMATCHED")],
+            ["runners_with_form_pct", round(100 * sum(1 for r in runners if (r.get("runs_n") or 0) >= 2)
+                                            / len(runners)) if runners else 0],
+            ["runners_with_rating_pct", round(100 * sum(1 for r in runners if r.get("rating"))
+                                              / len(runners)) if runners else 0],
+            ["runners_with_trainer_form_pct", round(100 * sum(1 for r in runners if r.get("trainer_rate") is not None)
+                                                    / len(runners)) if runners else 0],
+            ["races_flagged", sum(1 for x in races if x.get("flag"))],
+            ["baseline_settled", sum(1 for r in fav_best if r["status"] == "SETTLED")], []]
     for course, (nr, nrun) in sorted(per_meeting.items()):
         dash.append([f"meeting: {course}", f"{nr} races, {nrun} priced runners"])
     for w in warnings[:40]:
