@@ -185,6 +185,8 @@ def place_terms(field, handicap):
 
 def to_float(x, default=None):
     try:
+        if isinstance(x, str) and x.strip().endswith("%"):
+            return float(x.strip()[:-1]) / 100        # a cell someone formatted as a percentage
         return float(x)
     except (TypeError, ValueError):
         return default
@@ -964,7 +966,11 @@ SUM_HEAD = ["Segment", "Bets", "Wins", "Win %", "Places", "Place %",
             "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %", "Avg CLV %"]
 
 
+PCT_SUMMARY_COLS = ["Win %", "Place %", "Win ROI %", "Place ROI %", "Avg CLV %"]
+
+
 def stats_row(name, g):
+    """Rates are stored as fractions (0.25 = 25%); the sheet shows them with a % format."""
     n = len(g)
     if n == 0:
         return [name, 0, 0, "", 0, "", 0, "", 0, "", ""]
@@ -973,9 +979,9 @@ def stats_row(name, g):
     wp = sum(to_float(r["pnl_win_units"], 0) for r in g)
     pp = sum(to_float(r["pnl_place_units"], 0) for r in g)
     clvs = [c for c in (to_float(r.get("clv_pct")) for r in g) if c is not None]
-    return [name, n, w, round(w / n * 100, 1), p, round(p / n * 100, 1),
-            round(wp, 2), round(wp / n * 100, 1), round(pp, 2), round(pp / n * 100, 1),
-            round(sum(clvs) / len(clvs), 1) if clvs else ""]
+    return [name, n, w, round(w / n, 4), p, round(p / n, 4),
+            round(wp, 2), round(wp / n, 4), round(pp, 2), round(pp / n, 4),
+            round(sum(clvs) / len(clvs) / 100, 4) if clvs else ""]
 
 
 def summarise(rows, fav_rows=None):
@@ -1104,6 +1110,99 @@ def load_snapshots(sh, day):
 
 
 SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price", "src"]
+
+
+R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
+          "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
+          "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason",
+          "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs"]
+BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "model_prob", "value_edge",
+             "form_score", "confidence", "reason", "race_flag", "status", "position",
+             "field_size", "sp", "clv_pct", "won", "placed", "pnl_win_units", "pnl_place_units"]
+
+HIGHLIGHT_EDGE = 0.05                     # rows with an edge of 5% or more are highlighted green
+HIGHLIGHT_RGB = {"red": 0.78, "green": 0.94, "blue": 0.81}
+RUNNER_PCT = ["fair_prob", "model_prob", "value_edge", "ev", "trainer_rate", "jockey_rate", "confidence"]
+# tab -> (header, column holding the edge (or (model, market) columns), columns shown as %)
+# The trackers are read back by this script, so they are highlighted but their numbers are left as they are.
+def format_specs():
+    return {
+        "RUNNERS_TARGET": (R_HEAD, "value_edge", RUNNER_PCT),
+        "SIGNALS": (R_HEAD + ["shorten_score"], "value_edge", RUNNER_PCT),
+        "VALUE_BETS_TARGET": (R_HEAD, "value_edge", RUNNER_PCT),
+        "BETS_TO_PLACE": (R_HEAD, "value_edge", RUNNER_PCT),
+        "BEST_PER_RACE": (BEST_HEAD, "value_edge", ["model_prob", "value_edge", "confidence"]),
+        "BET_TRACKER": (TRACKER_COLS, "value_edge", []),
+        "RACE_BEST_TRACKER": (TRACKER_COLS, "value_edge", []),
+        "FAV_BASELINE_TRACKER": (TRACKER_COLS, "value_edge", []),
+        "RUNNER_LOG": (RL_COLS, ("model_prob", "fair_prob"), []),
+        "RACE_BEST_SUMMARY": (SUM_HEAD, None, PCT_SUMMARY_COLS),
+        "TRACKER_SUMMARY": (SUM_HEAD, None, PCT_SUMMARY_COLS),
+    }
+
+
+def col_letter(i):
+    out = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+
+def edge_formula(head, edge):
+    if isinstance(edge, tuple):
+        a, b = (col_letter(head.index(x)) for x in edge)
+        return f"=AND(ISNUMBER(${a}2),ISNUMBER(${b}2),${a}2-${b}2>={HIGHLIGHT_EDGE})"
+    c = col_letter(head.index(edge))
+    return f"=AND(ISNUMBER(${c}2),${c}2>={HIGHLIGHT_EDGE})"
+
+
+def formatting_requests(meta_sheets, specs=None):
+    """Batch-update requests that (a) highlight rows with edge >= 5% and (b) show rate columns as %.
+    Safe to run every time: an existing identical rule is left alone and stale ones are replaced."""
+    specs = format_specs() if specs is None else specs
+    dele, add = [], []
+    for sh_meta in meta_sheets:
+        props = sh_meta.get("properties", {})
+        title, sid = props.get("title"), props.get("sheetId")
+        if title not in specs:
+            continue
+        head, edge, pct_cols = specs[title]
+        existing = sh_meta.get("conditionalFormats", []) or []
+        if edge is not None:
+            want = edge_formula(head, edge)
+            have = False
+            for idx, cf in enumerate(existing):
+                vals = ((cf.get("booleanRule") or {}).get("condition") or {}).get("values") or [{}]
+                f = vals[0].get("userEnteredValue", "")
+                if f == want:
+                    have = True
+                elif f.startswith("=AND(ISNUMBER(") and f.endswith(f">={HIGHLIGHT_EDGE})"):
+                    dele.append({"deleteConditionalFormatRule": {"sheetId": sid, "index": idx}})
+            if not have:
+                add.append({"addConditionalFormatRule": {"index": 0, "rule": {
+                    "ranges": [{"sheetId": sid, "startRowIndex": 1, "startColumnIndex": 0,
+                                "endColumnIndex": len(head)}],
+                    "booleanRule": {"condition": {"type": "CUSTOM_FORMULA",
+                                                  "values": [{"userEnteredValue": want}]},
+                                    "format": {"backgroundColor": HIGHLIGHT_RGB}}}}})
+        for name in pct_cols:
+            c = head.index(name)
+            add.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": 1, "startColumnIndex": c, "endColumnIndex": c + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}},
+                "fields": "userEnteredFormat.numberFormat"}})
+    # delete highest index first so earlier deletions do not shift the later ones
+    dele.sort(key=lambda r: (r["deleteConditionalFormatRule"]["sheetId"], -r["deleteConditionalFormatRule"]["index"]))
+    return dele + add
+
+
+def apply_formatting(sh):
+    meta = sh.fetch_sheet_metadata()
+    reqs = formatting_requests(meta.get("sheets", []))
+    if reqs:
+        sh.batch_update({"requests": reqs})
 
 
 VISIBLE_TABS = ["BEST_PER_RACE", "BETS_TO_PLACE", "RACE_BEST_SUMMARY", "RACE_BEST_TRACKER"]
@@ -1483,10 +1582,7 @@ def main():
     save_tracker(sh, fav_best, "FAV_BASELINE_TRACKER")
 
     # 5. write tabs
-    r_head = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
-              "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
-              "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason",
-              "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs"]
+    r_head = R_HEAD
 
     def rr(r):
         return [r["date"], r["course"], r["region"], r["time"], r["horse"], r["odds"], r["dec"],
@@ -1536,10 +1632,7 @@ def main():
 
     recent = (day - dt.timedelta(days=1)).isoformat()
     card = sorted((r for r in race_best if r["date"] >= recent), key=card_order)
-    write_tab(sh, "BEST_PER_RACE",
-              ["date", "time", "course", "region", "horse", "odds", "model_prob", "value_edge",
-               "form_score", "confidence", "reason", "race_flag", "status", "position",
-               "field_size", "sp", "clv_pct", "won", "placed", "pnl_win_units", "pnl_place_units"],
+    write_tab(sh, "BEST_PER_RACE", BEST_HEAD,
               [[r["date"], r["time"], r["course"], r["region"], r["horse"], r["odds_at_pick"],
                 r["model_prob"], r["value_edge"], r["form_score"], r["confidence"], r["reason"],
                 r["race_flag"], r["status"], r["position"], r["field_size"], r["sp"],
@@ -1608,6 +1701,10 @@ def main():
     write_tab(sh, "DASHBOARD", ["item", "value"], dash)
     append_rows(sh, "RUN_LOG", ["run_time", "target_day", "races", "runners", "bets", "status"],
                 [[stamp, day.isoformat(), len(races), len(runners), len(bets), status]])
+    try:
+        apply_formatting(sh)
+    except Exception as ex:                     # cosmetic only, never fail the run for it
+        log(f"  could not apply highlighting / % formats: {ex}")
     try:
         tidy_tabs(sh)
     except Exception as ex:                     # cosmetic only, never fail the run for it
