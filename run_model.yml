@@ -1,32 +1,50 @@
-name: Horse Racing Model
+name: Run horse racing model
 
 on:
   schedule:
-    # every 30 minutes
-    - cron: "*/30 * * * *"
-  workflow_dispatch:
+    - cron: "*/30 6-21 * * *"   # every 30 min during racing hours (UTC)
+    - cron: "15 22 * * *"       # late run: settles results, runs the analysis, targets tomorrow
+  workflow_dispatch: {}
+
+concurrency:
+  group: horse-model
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Run model + update sheet
+      - name: Run model
         env:
           GOOGLE_CREDS: ${{ secrets.GOOGLE_CREDS }}
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           REGION: ${{ secrets.REGION }}
           MIN_VALUE_EDGE: ${{ secrets.MIN_VALUE_EDGE }}
-        run: |
-          echo "$GOOGLE_CREDS" > credentials.json
-          python horse_model.py
+          # optional settings: leave the secret unset to use the default
+          MIN_EV: ${{ secrets.MIN_EV }}
+          STRICT_FILTERS: ${{ secrets.STRICT_FILTERS }}
+          AUTO_FILTER: ${{ secrets.AUTO_FILTER }}
+          USE_FITTED_WEIGHTS: ${{ secrets.USE_FITTED_WEIGHTS }}
+          LOG_WINDOW_MIN: ${{ secrets.LOG_WINDOW_MIN }}
+          MAX_FIELD_HCAP: ${{ secrets.MAX_FIELD_HCAP }}
+          DEBUG_DUMP: "1"
+        run: python horse_model.py
+
+      - name: Save debug pages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 3
