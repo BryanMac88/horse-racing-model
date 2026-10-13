@@ -32,6 +32,11 @@ Environment variables
   MAX_WIN_DEC     win-focus: maximum decimal price, default 5.0 (4/1)
   MAX_FIELD       win-focus: skip races with more declared runners than this, default 12
   BEST_RULE       prob (default) = BEST_PER_RACE picks the horse most likely to win; edge = biggest value edge
+
+Staking used for the euro P&L and ROI columns (how the bets are actually placed):
+  price under 9/2  -> 5 euro win
+  9/2 or bigger    -> 2.50 each way (2.50 win + 2.50 place), place part paid at 1/5 of the odds,
+                      number of places by field size (2 for 5-7 runners, 3 for 8+, 4 for 16+ handicaps)
   DEBUG_DUMP      set to 1 to save fetched pages into ./debug (uploaded by the workflow)
 """
 import datetime as dt
@@ -69,6 +74,10 @@ MIN_WIN_PROB = float(os.environ.get("MIN_WIN_PROB") or 0.25)
 MAX_WIN_DEC = float(os.environ.get("MAX_WIN_DEC") or 5.0)
 MAX_FIELD = int(os.environ.get("MAX_FIELD") or 12)
 BEST_RULE = (os.environ.get("BEST_RULE") or "prob").strip().lower()
+STAKE_WIN = 5.0                    # euro on a straight win bet
+STAKE_EW = 2.5                     # euro each way (win part and place part)
+EW_FROM = 5.5                      # decimal price at which win bets become each way (9/2)
+EW_PLACE_FRACTION = 0.2            # each-way place part pays 1/5 of the odds
 PLACE_RULES_V = "2"                # bumped when place settlement changed; older rows are re-checked
 AUTO_FILTER = (os.environ.get("AUTO_FILTER") or "1") != "0"
 USE_FITTED = (os.environ.get("USE_FITTED_WEIGHTS") or "0") == "1"
@@ -924,7 +933,48 @@ TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pic
                 "field_size", "places_paid", "sp", "sp_dec", "won", "placed",
                 "pnl_win_units", "pnl_place_units", "settled_at",
                 "form_score", "confidence", "reason", "race_flag", "clv_pct", "price_src",
-                "declared", "rules_v", "night_dec", "night_clv_pct", "pick_rule", "nr_note"]
+                "declared", "rules_v", "night_dec", "night_clv_pct", "pick_rule", "nr_note",
+                "bet_type", "stake_eur", "pnl_eur", "pnl_eur_sp"]
+
+
+def staking(dec, won, placed, field):
+    """(bet type, euro staked, euro profit) for one bet at decimal price `dec`.
+    Under 9/2: 5 euro win. 9/2 or bigger: 2.50 each way with the place part at 1/5 of the odds.
+    In a field of 4 or fewer there is no place market, so the place half is refunded."""
+    if not dec or dec <= 1:
+        return "", 0.0, None
+    if dec < EW_FROM:
+        return "WIN 5", STAKE_WIN, round(STAKE_WIN * (dec - 1) if won else -STAKE_WIN, 2)
+    win_part = STAKE_EW * (dec - 1) if won else -STAKE_EW
+    if field and field <= 4:
+        return "EW 2.50 (no place market)", STAKE_EW, round(win_part, 2)
+    place_dec = (dec - 1) * EW_PLACE_FRACTION + 1
+    place_part = STAKE_EW * (place_dec - 1) if placed else -STAKE_EW
+    return "EW 2.50", 2 * STAKE_EW, round(win_part + place_part, 2)
+
+
+def row_staking(row):
+    """Staking result for a settled tracker row at the price taken and at the SP.
+    Returns {"pick": (type, stake, pnl), "sp": (type, stake, pnl)} or None if not a settled bet."""
+    if row.get("status") != "SETTLED":
+        return None
+    won = int(to_float(row.get("won"), 0)) == 1
+    placed = int(to_float(row.get("placed"), 0)) == 1
+    field = to_float(row.get("field_size"), 0) or 0
+    sp = to_float(row.get("sp_dec"))
+    pick = to_float(row.get("dec_at_pick")) or sp
+    return {"pick": staking(pick, won, placed, field), "sp": staking(sp or pick, won, placed, field)}
+
+
+def apply_staking(rows):
+    """Fill bet_type / stake_eur / pnl_eur (at the price taken) / pnl_eur_sp on every tracker row."""
+    for r in rows:
+        st = row_staking(r)
+        if st:
+            r["bet_type"], r["stake_eur"], r["pnl_eur"] = st["pick"]
+            r["pnl_eur_sp"] = st["sp"][2]
+        elif r.get("status") == "NON-RUNNER":
+            r["bet_type"], r["stake_eur"], r["pnl_eur"], r["pnl_eur_sp"] = "NON-RUNNER", 0, 0, 0
 
 
 def field_count(entries, declared=None):
@@ -1088,17 +1138,31 @@ def race_key(r):
 
 SUM_HEAD = ["Segment", "Bets", "Wins", "Win %", "Places", "Place %",
             "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %", "Avg CLV %",
-            "Avg night CLV %"]
+            "Avg night CLV %", "Staked €", "P&L €", "ROI % (my staking)", "ROI at SP % (my staking)"]
 
 
-PCT_SUMMARY_COLS = ["Win %", "Place %", "Win ROI %", "Place ROI %", "Avg CLV %", "Avg night CLV %"]
+PCT_SUMMARY_COLS = ["Win %", "Place %", "Win ROI %", "Place ROI %", "Avg CLV %", "Avg night CLV %",
+                    "ROI % (my staking)", "ROI at SP % (my staking)"]
+EUR_SUMMARY_COLS = ["Staked €", "P&L €"]
+
+
+def _staking_cols(g):
+    """Euro staked, euro profit and ROI using the 5 win / 2.50 each-way staking."""
+    sts = [row_staking(r) for r in g]
+    sts = [x for x in sts if x]
+    staked = sum(x["pick"][1] for x in sts)
+    pnl = sum(x["pick"][2] or 0 for x in sts)
+    staked_sp = sum(x["sp"][1] for x in sts)
+    pnl_sp = sum(x["sp"][2] or 0 for x in sts)
+    return [round(staked, 2), round(pnl, 2),
+            round(pnl / staked, 4) if staked else "", round(pnl_sp / staked_sp, 4) if staked_sp else ""]
 
 
 def stats_row(name, g):
     """Rates are stored as fractions (0.25 = 25%); the sheet shows them with a % format."""
     n = len(g)
     if n == 0:
-        return [name, 0, 0, "", 0, "", 0, "", 0, "", "", ""]
+        return [name, 0, 0, "", 0, "", 0, "", 0, "", "", "", 0, 0, "", ""]
     w = sum(int(to_float(r["won"], 0)) for r in g)
     p = sum(int(to_float(r["placed"], 0)) for r in g)
     wp = sum(to_float(r["pnl_win_units"], 0) for r in g)
@@ -1108,7 +1172,7 @@ def stats_row(name, g):
     return [name, n, w, round(w / n, 4), p, round(p / n, 4),
             round(wp, 2), round(wp / n, 4), round(pp, 2), round(pp / n, 4),
             round(sum(clvs) / len(clvs) / 100, 4) if clvs else "",
-            round(sum(nclvs) / len(nclvs) / 100, 4) if nclvs else ""]
+            round(sum(nclvs) / len(nclvs) / 100, 4) if nclvs else ""] + _staking_cols(g)
 
 
 def summarise(rows, fav_rows=None):
@@ -1212,6 +1276,7 @@ def load_tracker(sh, tab="BET_TRACKER"):
 
 
 def save_tracker(sh, rows, tab="BET_TRACKER"):
+    apply_staking(rows)
     write_tab(sh, tab, TRACKER_COLS, [[r.get(c, "") for c in TRACKER_COLS] for r in rows])
 
 
@@ -1251,7 +1316,8 @@ R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob
 BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "night_price", "model_prob",
              "value_edge", "form_score", "confidence", "reason", "race_flag", "status", "position",
              "field_size", "places_paid", "sp", "clv_pct", "night_clv_pct", "won", "placed",
-             "pnl_win_units", "pnl_place_units", "pick_rule"]
+             "pnl_win_units", "pnl_place_units", "bet_type", "stake_eur", "pnl_eur", "pnl_eur_sp",
+             "pick_rule"]
 
 HIGHLIGHT_EDGE = 0.05                     # rows with an edge of 5% or more are highlighted green
 HIGHLIGHT_RGB = {"red": 0.78, "green": 0.94, "blue": 0.81}
@@ -1264,13 +1330,14 @@ def format_specs():
         "SIGNALS": (R_HEAD + ["shorten_score"], "value_edge", RUNNER_PCT),
         "VALUE_BETS_TARGET": (R_HEAD, "value_edge", RUNNER_PCT),
         "BETS_TO_PLACE": (R_HEAD, "value_edge", RUNNER_PCT),
-        "BEST_PER_RACE": (BEST_HEAD, "value_edge", ["model_prob", "value_edge", "confidence"]),
+        "BEST_PER_RACE": (BEST_HEAD, "value_edge", ["model_prob", "value_edge", "confidence"],
+                      ["stake_eur", "pnl_eur", "pnl_eur_sp"]),
         "BET_TRACKER": (TRACKER_COLS, "value_edge", []),
         "RACE_BEST_TRACKER": (TRACKER_COLS, "value_edge", []),
         "FAV_BASELINE_TRACKER": (TRACKER_COLS, "value_edge", []),
         "RUNNER_LOG": (RL_COLS, ("model_prob", "fair_prob"), []),
-        "RACE_BEST_SUMMARY": (SUM_HEAD, None, PCT_SUMMARY_COLS),
-        "TRACKER_SUMMARY": (SUM_HEAD, None, PCT_SUMMARY_COLS),
+        "RACE_BEST_SUMMARY": (SUM_HEAD, None, PCT_SUMMARY_COLS, EUR_SUMMARY_COLS),
+        "TRACKER_SUMMARY": (SUM_HEAD, None, PCT_SUMMARY_COLS, EUR_SUMMARY_COLS),
     }
 
 
@@ -1301,7 +1368,8 @@ def formatting_requests(meta_sheets, specs=None):
         title, sid = props.get("title"), props.get("sheetId")
         if title not in specs:
             continue
-        head, edge, pct_cols = specs[title]
+        head, edge, pct_cols, *rest = specs[title]
+        eur_cols = rest[0] if rest else []
         existing = sh_meta.get("conditionalFormats", []) or []
         if edge is not None:
             want = edge_formula(head, edge)
@@ -1325,6 +1393,12 @@ def formatting_requests(meta_sheets, specs=None):
             add.append({"repeatCell": {
                 "range": {"sheetId": sid, "startRowIndex": 1, "startColumnIndex": c, "endColumnIndex": c + 1},
                 "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}},
+                "fields": "userEnteredFormat.numberFormat"}})
+        for name in eur_cols:
+            c = head.index(name)
+            add.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": 1, "startColumnIndex": c, "endColumnIndex": c + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "CURRENCY", "pattern": "€#,##0.00"}}},
                 "fields": "userEnteredFormat.numberFormat"}})
     # delete highest index first so earlier deletions do not shift the later ones
     dele.sort(key=lambda r: (r["deleteConditionalFormatRule"]["sheetId"], -r["deleteConditionalFormatRule"]["index"]))
@@ -1777,7 +1851,8 @@ def main():
                 r["form_score"], r["confidence"], r["reason"], r["race_flag"], r["status"],
                 r["position"], r["field_size"], r["places_paid"], r["sp"], r["clv_pct"],
                 r["night_clv_pct"], r["won"], r["placed"], r["pnl_win_units"],
-                r["pnl_place_units"], r["pick_rule"] or "edge"]
+                r["pnl_place_units"], r["bet_type"], r["stake_eur"], r["pnl_eur"], r["pnl_eur_sp"],
+                r["pick_rule"] or "edge"]
                for r in card])
     rhead, rrows = summarise(race_best, fav_best)
     write_tab(sh, "RACE_BEST_SUMMARY", rhead, rrows)
@@ -1822,6 +1897,10 @@ def main():
             ["race_best_settled", sum(1 for r in race_best if r["status"] == "SETTLED")],
             ["race_best_non_runners", sum(1 for r in race_best if r["status"] == "NON-RUNNER")],
             ["place_results_rechecked", rechecked],
+            ["bets_staking_pnl_eur", round(sum(to_float(r.get("pnl_eur"), 0) for r in tracker
+                                               if r["status"] == "SETTLED"), 2)],
+            ["race_best_staking_pnl_eur", round(sum(to_float(r.get("pnl_eur"), 0) for r in race_best
+                                                    if r["status"] == "SETTLED"), 2)],
             ["bets_to_place_rule", f"win-focus (top model pick, win prob >= {MIN_WIN_PROB:.0%}, price <= {MAX_WIN_DEC})"
              if WIN_FOCUS else "value edge"], ["best_per_race_rule", BEST_RULE],
             ["runners_with_night_price_pct", round(100 * sum(1 for r in runners if r.get("night_best"))
