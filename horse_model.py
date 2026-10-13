@@ -26,6 +26,11 @@ Environment variables
   USE_FITTED_WEIGHTS  1 = use weights fitted from your own results once 300+ races are logged
   ANALYSE         1 = run the calibration / weight-fitting step on every run (default: late run only)
   LOG_WINDOW_MIN  minutes before the off to log a race's inputs, default 35 (use 65 if you run hourly)
+  WIN_FOCUS       1 (default) = BETS_TO_PLACE backs only the model's top-rated horse in a race, aiming
+                  for winners rather than value; 0 = the older value-edge selection
+  MIN_WIN_PROB    win-focus: minimum model win probability, default 0.25
+  MAX_WIN_DEC     win-focus: maximum decimal price, default 6.0 (5/1)
+  BEST_RULE       prob (default) = BEST_PER_RACE picks the horse most likely to win; edge = biggest value edge
   DEBUG_DUMP      set to 1 to save fetched pages into ./debug (uploaded by the workflow)
 """
 import datetime as dt
@@ -56,6 +61,12 @@ MAX_PER_MEETING = int(os.environ.get("MAX_PER_MEETING") or 3)
 BIG_FIELD = int(os.environ.get("MAX_FIELD_HCAP") or 16)
 STRICT = (os.environ.get("STRICT_FILTERS") or "1") != "0"
 MIN_EV = float(os.environ.get("MIN_EV") or 0.0)
+MIN_EV_SET = bool(os.environ.get("MIN_EV"))
+WIN_FOCUS = (os.environ.get("WIN_FOCUS") or "1") != "0"
+MIN_WIN_PROB = float(os.environ.get("MIN_WIN_PROB") or 0.25)
+MAX_WIN_DEC = float(os.environ.get("MAX_WIN_DEC") or 6.0)
+BEST_RULE = (os.environ.get("BEST_RULE") or "prob").strip().lower()
+PLACE_RULES_V = "2"                # bumped when place settlement changed; older rows are re-checked
 AUTO_FILTER = (os.environ.get("AUTO_FILTER") or "1") != "0"
 USE_FITTED = (os.environ.get("USE_FITTED_WEIGHTS") or "0") == "1"
 ANALYSE = (os.environ.get("ANALYSE") or "0") == "1"
@@ -171,14 +182,16 @@ def frac_text(dec):
 
 
 def place_terms(field, handicap):
-    """(places paid, fraction of win odds) using standard UK/IRE each-way terms."""
+    """(places paid, fraction of win odds), standard UK/IRE each-way terms:
+    2-4 runners: win only; 5-7 runners: 2 places; 8+ runners: 3 places;
+    handicaps with 16+ runners: 4 places. Fraction is 1/4 for 5-7 runners and big handicaps, else 1/5."""
     if field <= 4:
         return 1, 1.0            # no place market, treat as winner only
     if field <= 7:
         return 2, 0.25
     if handicap and field >= 16:
         return 4, 0.25
-    if handicap:
+    if handicap and field >= 12:
         return 3, 0.25
     return 3, 0.2
 
@@ -656,9 +669,16 @@ def pick_open(hist, now, lo=MOVER_MIN_AGE_MIN, src=None):
     return min(old)[1] if old else None
 
 
+def pick_night_best(hist, race_day):
+    """Best bookmaker price from the last snapshot taken the evening before the race, else None."""
+    cand = [h for h in hist if len(h) > 3 and h[3] and h[2] == "b" and h[0].date() < race_day]
+    return max(cand, key=lambda h: h[0])[3] if cand else None
+
+
 def add_movers(runners, snaps, now):
     for r in runners:
         hist = snaps.get(snap_key(r["date"], r["course"], r["time"], r["horse"]), [])
+        r["night_best"] = pick_night_best(hist, dt.date.fromisoformat(r["date"]))
         src = r.get("src", "p")
         ref1 = pick_ref(hist, now, 60, MOVER_MIN_AGE_MIN, 150, src)
         ref2, refo = pick_ref(hist, now, src=src), pick_open(hist, now, src=src)
@@ -747,6 +767,8 @@ def add_model(runners):
                                        + 0.5 * max(0.0, -(r.get("mover_night_pct") or 0.0)), 1)
             top = sorted(r.pop("_terms").items(), key=lambda kv: -kv[1])[:2]
             r["reason"] = ", ".join(f"{LABEL.get(k, k)} {v:+.2f}" for k, v in top if v >= 0.03)
+        for i, r in enumerate(sorted(field, key=lambda x: -x["model_prob"])):
+            r["model_rank"], r["field_n"] = i + 1, len(field)
 
 
 def runner_segments(r):
@@ -783,20 +805,36 @@ def blocked_segments(rows, min_n=MIN_SEG_N):
 
 
 def choose_bets(runners, blocked=()):
+    """BETS_TO_PLACE. WIN_FOCUS (default): only the model's top-rated horse in a race, with a real win
+    chance (>= MIN_WIN_PROB), a short enough price, no poor recent form and no long layoff. Otherwise the
+    older rule: biggest value edge above MIN_EDGE inside the price window."""
     best = {}
     for r in runners:
-        if r["value_edge"] >= MIN_EDGE and MIN_DEC <= r["dec"] <= MAX_DEC:
-            if STRICT and (r.get("flag") or (r.get("runs_n") or 0) < 2):
-                continue                                # big-field handicaps, unraced fields, debutants
-            if r.get("dec_best") and r["ev"] < MIN_EV:
-                continue                                # no value even at the best bookmaker price
-            if blocked and set(runner_segments(r)) & set(blocked):
-                continue                                # segment the tracker shows is losing
-            k = (r["date"], r["course"], r["time"])
-            if k not in best or r["value_edge"] > best[k]["value_edge"]:
-                best[k] = r                             # one selection per race
+        if WIN_FOCUS:
+            ok = (r.get("model_rank") == 1 and r["model_prob"] >= MIN_WIN_PROB
+                  and 1.5 <= r["dec"] <= MAX_WIN_DEC and r["value_edge"] >= 0
+                  and (r.get("form_score") is None or r["form_score"] >= 0.40)
+                  and (r.get("days_off") is None or r["days_off"] <= 90))
+            if ok and MIN_EV_SET and r.get("dec_best") and r["ev"] < MIN_EV:
+                ok = False
+            rank_key = lambda x: x["model_prob"]
+        else:
+            ok = r["value_edge"] >= MIN_EDGE and MIN_DEC <= r["dec"] <= MAX_DEC
+            if ok and r.get("dec_best") and r["ev"] < MIN_EV:
+                ok = False                              # no value even at the best bookmaker price
+            rank_key = lambda x: x["value_edge"]
+        if not ok:
+            continue
+        if STRICT and (r.get("flag") or (r.get("runs_n") or 0) < 2):
+            continue                                    # big-field handicaps, unraced fields, debutants
+        if blocked and set(runner_segments(r)) & set(blocked):
+            continue                                    # segment the tracker shows is losing
+        k = (r["date"], r["course"], r["time"])
+        if k not in best or rank_key(r) > rank_key(best[k]):
+            best[k] = r                                 # one selection per race
+    score = (lambda x: -x["model_prob"]) if WIN_FOCUS else (lambda x: -x["value_edge"])
     picks, per_meet = [], defaultdict(int)
-    for r in sorted(best.values(), key=lambda x: -x["value_edge"]):
+    for r in sorted(best.values(), key=score):
         if per_meet[r["course"]] >= MAX_PER_MEETING:
             continue
         picks.append(r)
@@ -813,10 +851,15 @@ def _by_race(runners):
     return races
 
 
-def choose_best_per_race(runners):
-    """Highest value_edge runner in every race (no threshold); needs 3+ priced runners."""
-    picks = [max(f, key=lambda x: (x["value_edge"], -x["dec"]))
-             for f in _by_race(runners).values() if len(f) >= 3]
+def choose_best_per_race(runners, rule=None):
+    """One pick in every race (needs 3+ priced runners). rule 'prob' (default): the horse most likely to win
+    on the model, which gives the most winners; rule 'edge': the biggest value edge over the market."""
+    rule = rule or BEST_RULE
+    if rule == "edge":
+        key = lambda x: (x["value_edge"], -x["dec"])
+    else:
+        key = lambda x: (x["model_prob"], -x["dec"])
+    picks = [max(f, key=key) for f in _by_race(runners).values() if len(f) >= 3]
     return sorted(picks, key=lambda x: (x["date"], x["time"], x["course"]))
 
 
@@ -833,7 +876,7 @@ def card_order(r):
     return (-d, r["course"], r["time"])
 
 
-def pick_fields(b):
+def pick_fields(b, rule=""):
     fs = b.get("form_score")
     best = b.get("dec_best")
     price = best or b["dec"]
@@ -843,17 +886,19 @@ def pick_fields(b):
             "form_score": round(fs, 2) if fs is not None else "",
             "confidence": b.get("confidence", ""), "reason": b.get("reason", ""),
             "race_flag": b.get("flag", ""),
-            "price_src": f"best of {b.get('books')} books" if best else "probable SP"}
+            "price_src": f"best of {b.get('books')} books" if best else "probable SP",
+            "declared": b.get("declared", ""), "night_dec": b.get("night_best") or "",
+            "pick_rule": rule}
 
 
-def upsert_race_bests(rows, picks):
+def upsert_race_bests(rows, picks, rule=""):
     """One row per race. A PENDING row is re-picked on each run until the race is off
     (the scrape only sees races still to run); settled or started races are left alone."""
     by_key = {r["key"]: r for r in rows}
     added = 0
     for b in picks:
         key = f"{b['date']}|{norm(b['course'])}|{b['time']}"
-        vals = pick_fields(b)
+        vals = pick_fields(b, rule)
         row = by_key.get(key)
         if row is None:
             row = {**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
@@ -874,20 +919,37 @@ TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pic
                 "dec_at_pick", "model_prob", "value_edge", "status", "position",
                 "field_size", "places_paid", "sp", "sp_dec", "won", "placed",
                 "pnl_win_units", "pnl_place_units", "settled_at",
-                "form_score", "confidence", "reason", "race_flag", "clv_pct", "price_src"]
+                "form_score", "confidence", "reason", "race_flag", "clv_pct", "price_src",
+                "declared", "rules_v", "night_dec", "night_clv_pct", "pick_rule"]
+
+
+def field_count(entries, declared=None):
+    """How many horses actually ran. Only rows that carry a result position (1st, 2nd, PU, F ...) count,
+    so other horse links on the page cannot inflate the field, and it can never exceed the declared runners."""
+    runners = [e for e in entries if not e.get("nr")]
+    with_pos = [e for e in runners if e.get("pos") is not None]
+    n = len(with_pos) if len(with_pos) >= 2 else len(runners)
+    d = to_float(declared)
+    if d and d >= 2:
+        n = min(n, int(d))
+    return n
 
 
 def settle_row(row, finishers, handicap, now):
-    """Fill result columns on a tracker row. finishers = parse_result() entries in page order."""
+    """Fill result columns on a tracker row. finishers = parse_result() entries in page order.
+    A horse that is not on a result page that clearly lists the finishers is a NON-RUNNER (stake returned)."""
     runners = [e for e in finishers if not e.get("nr")]
     names = [e["norm"] for e in runners]
     target = norm(row["horse"])
     if target not in names:
-        row["status"] = "UNMATCHED"       # horse not on the result page: check by hand (or NR)
-        return
+        if sum(1 for e in runners if e.get("pos") is not None) >= 3:
+            row.update({"status": "NON-RUNNER", "pnl_win_units": 0, "pnl_place_units": 0,
+                        "won": "", "placed": "", "rules_v": PLACE_RULES_V,
+                        "settled_at": now.isoformat(timespec="minutes")})
+        return                                  # page not clear enough to say: try again next run
     i = names.index(target)
     e = runners[i]
-    field = len(runners)
+    field = field_count(finishers, row.get("declared"))
     pos = e["pos"] if e.get("pos") is not None else i + 1
     places, frac = place_terms(field, handicap)
     sp_dec = e["dec"] or to_float(row.get("dec_at_pick"), 2.0)
@@ -895,8 +957,10 @@ def settle_row(row, finishers, handicap, now):
     placed = pos <= places
     place_odds = (sp_dec - 1) * frac + 1
     pick_dec = to_float(row.get("dec_at_pick"))
+    night_dec = to_float(row.get("night_dec"))
     clv = round((pick_dec / sp_dec - 1) * 100, 1) if pick_dec and sp_dec else ""
-    row.update({"clv_pct": clv,
+    nclv = round((night_dec / sp_dec - 1) * 100, 1) if night_dec and sp_dec else ""
+    row.update({"clv_pct": clv, "night_clv_pct": nclv, "rules_v": PLACE_RULES_V,
         "status": "SETTLED", "position": pos if pos != 99 else "DNF", "field_size": field,
         "places_paid": places, "sp": e["odds"] or "", "sp_dec": round(sp_dec, 3),
         "won": 1 if won else 0, "placed": 1 if placed else 0,
@@ -904,6 +968,44 @@ def settle_row(row, finishers, handicap, now):
         "pnl_place_units": round(place_odds - 1 if placed else -1, 3),
         "settled_at": now.isoformat(timespec="minutes"),
     })
+
+
+def recheck_places(rows, now, limit=150):
+    """One-off repair: rows settled before PLACE_RULES_V that finished 2nd-4th are re-settled from the
+    result page with the corrected field size / place terms. A row is only changed if the re-settle works."""
+    todo, done = [], 0
+    for r in rows:
+        if r.get("status") != "SETTLED" or str(r.get("rules_v")) == PLACE_RULES_V:
+            continue
+        pos = to_float(r.get("position"))
+        if pos in (2.0, 3.0, 4.0):
+            todo.append(r)
+        else:
+            r["rules_v"] = PLACE_RULES_V       # a win or an unplaced finish cannot change
+    by_day = defaultdict(list)
+    for r in todo[:limit]:
+        by_day[r["date"]].append(r)
+    for date_s, group in by_day.items():
+        try:
+            day = dt.date.fromisoformat(date_s)
+        except ValueError:
+            continue
+        needed = {(norm(r["course"]), r["time"]): r["course"] for r in group}
+        results = fetch_results_for(day, needed)
+        for r in group:
+            res = results.get((norm(r["course"]), r["time"]))
+            if res is None:
+                if now > race_off(day, r["time"]) + dt.timedelta(days=21):
+                    r["rules_v"] = PLACE_RULES_V          # page long gone: keep what we had
+                continue
+            trial = dict(r)
+            settle_row(trial, res[0], res[1], now)
+            if trial.get("status") == "SETTLED":
+                r.update(trial)
+                done += 1
+            elif trial.get("status") == "NON-RUNNER":
+                r.update(trial)
+    return done
 
 
 _RES_CACHE = {}
@@ -963,25 +1065,28 @@ def race_key(r):
 
 
 SUM_HEAD = ["Segment", "Bets", "Wins", "Win %", "Places", "Place %",
-            "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %", "Avg CLV %"]
+            "Win P&L (units)", "Win ROI %", "Place P&L (units)", "Place ROI %", "Avg CLV %",
+            "Avg night CLV %"]
 
 
-PCT_SUMMARY_COLS = ["Win %", "Place %", "Win ROI %", "Place ROI %", "Avg CLV %"]
+PCT_SUMMARY_COLS = ["Win %", "Place %", "Win ROI %", "Place ROI %", "Avg CLV %", "Avg night CLV %"]
 
 
 def stats_row(name, g):
     """Rates are stored as fractions (0.25 = 25%); the sheet shows them with a % format."""
     n = len(g)
     if n == 0:
-        return [name, 0, 0, "", 0, "", 0, "", 0, "", ""]
+        return [name, 0, 0, "", 0, "", 0, "", 0, "", "", ""]
     w = sum(int(to_float(r["won"], 0)) for r in g)
     p = sum(int(to_float(r["placed"], 0)) for r in g)
     wp = sum(to_float(r["pnl_win_units"], 0) for r in g)
     pp = sum(to_float(r["pnl_place_units"], 0) for r in g)
     clvs = [c for c in (to_float(r.get("clv_pct")) for r in g) if c is not None]
+    nclvs = [c for c in (to_float(r.get("night_clv_pct")) for r in g) if c is not None]
     return [name, n, w, round(w / n, 4), p, round(p / n, 4),
             round(wp, 2), round(wp / n, 4), round(pp, 2), round(pp / n, 4),
-            round(sum(clvs) / len(clvs) / 100, 4) if clvs else ""]
+            round(sum(clvs) / len(clvs) / 100, 4) if clvs else "",
+            round(sum(nclvs) / len(nclvs) / 100, 4) if nclvs else ""]
 
 
 def summarise(rows, fav_rows=None):
@@ -997,6 +1102,7 @@ def summarise(rows, fav_rows=None):
         fs = to_float(r.get("field_size"), 0)
         groups.setdefault("Field " + band(fs, [8, 13], FIELD_LABELS), []).append(r)
         groups.setdefault("Race " + ("flagged" if r.get("race_flag") else "OK"), []).append(r)
+        groups.setdefault("Pick rule: " + str(r.get("pick_rule") or "edge"), []).append(r)
         clv = to_float(r.get("clv_pct"))
         if clv is not None:
             groups.setdefault("Price " + ("shortened (CLV+)" if clv > 0 else "drifted (CLV-)"), []).append(r)
@@ -1076,6 +1182,8 @@ def load_tracker(sh, tab="BET_TRACKER"):
         d = {h: (v[i] if i < len(v) else "") for i, h in enumerate(head)}
         for c in TRACKER_COLS:
             d.setdefault(c, "")
+        if d["status"] == "UNMATCHED":
+            d["status"] = "NON-RUNNER"          # horses missing from the result are non-runners
         if d["key"]:
             rows.append(d)
     return rows
@@ -1101,7 +1209,8 @@ def load_snapshots(sh, day):
             continue
         try:
             snaps[snap_key(v[1], v[2], v[3], v[4])].append(
-                (dt.datetime.fromisoformat(v[0]), float(v[5]), v[6] if len(v) > 6 and v[6] else "p"))
+                (dt.datetime.fromisoformat(v[0]), float(v[5]), v[6] if len(v) > 6 and v[6] else "p",
+                 to_float(v[7]) if len(v) > 7 else None))
         except ValueError:
             continue
     if len(vals) > 30000:
@@ -1109,16 +1218,18 @@ def load_snapshots(sh, day):
     return snaps, max(0, len(vals) - 1)
 
 
-SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price", "src"]
+SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price", "src", "dec_best"]
 
 
 R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
           "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
           "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason",
-          "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs"]
-BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "model_prob", "value_edge",
-             "form_score", "confidence", "reason", "race_flag", "status", "position",
-             "field_size", "sp", "clv_pct", "won", "placed", "pnl_win_units", "pnl_place_units"]
+          "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs",
+          "night_price"]
+BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "night_price", "model_prob",
+             "value_edge", "form_score", "confidence", "reason", "race_flag", "status", "position",
+             "field_size", "places_paid", "sp", "clv_pct", "night_clv_pct", "won", "placed",
+             "pnl_win_units", "pnl_place_units", "pick_rule"]
 
 HIGHLIGHT_EDGE = 0.05                     # rows with an edge of 5% or more are highlighted green
 HIGHLIGHT_RGB = {"red": 0.78, "green": 0.94, "blue": 0.81}
@@ -1289,7 +1400,7 @@ def settle_log_races(races, now):
             continue
         entries, handicap = res
         ran = [e for e in entries if not e.get("nr")]
-        field = len(ran)
+        field = field_count(entries)
         places, _ = place_terms(field, handicap)
         found = {e["norm"]: (i, e) for i, e in enumerate(ran)}
         for it in items:
@@ -1528,6 +1639,11 @@ def main():
     settle_all(race_best, now, warnings)
     fav_best = load_tracker(sh, "FAV_BASELINE_TRACKER")
     settle_all(fav_best, now, warnings)
+    try:                                         # one-off repair of old place results (see recheck_places)
+        rechecked = sum(recheck_places(t, now) for t in (tracker, race_best, fav_best))
+    except Exception as ex:
+        rechecked = 0
+        warnings.append(f"place re-check failed: {ex}")
     try:
         runner_results_added = settle_runner_log(sh, now)
     except Exception as ex:                     # the research log must never break the main job
@@ -1548,8 +1664,8 @@ def main():
     add_movers(runners, snaps, now)
     stamp = now.isoformat(timespec="seconds")
     append_rows(sh, "MARKET_SNAPSHOTS_LOG", SNAP_HEAD,
-                [[stamp, r["date"], r["course"], r["time"], r["horse"], r["dec"], r.get("src", "p")]
-                 for r in runners])
+                [[stamp, r["date"], r["course"], r["time"], r["horse"], r["dec"], r.get("src", "p"),
+                  r.get("dec_best")] for r in runners])
 
     # 4. model + bets
     add_model(runners)
@@ -1571,14 +1687,14 @@ def main():
             continue
         tracker.append({**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
                         "course": b["course"], "time": b["time"], "status": "PENDING",
-                        **pick_fields(b)})
+                        **pick_fields(b, "win-focus" if WIN_FOCUS else "edge")})
         new_bets += 1
     save_tracker(sh, tracker)
 
     picks = choose_best_per_race(runners)
-    new_race_bests = upsert_race_bests(race_best, picks)
+    new_race_bests = upsert_race_bests(race_best, picks, BEST_RULE)
     save_tracker(sh, race_best, "RACE_BEST_TRACKER")
-    upsert_race_bests(fav_best, choose_favourite_per_race(runners))
+    upsert_race_bests(fav_best, choose_favourite_per_race(runners), "fav")
     save_tracker(sh, fav_best, "FAV_BASELINE_TRACKER")
 
     # 5. write tabs
@@ -1591,7 +1707,8 @@ def main():
                 r.get("days_off"), r.get("trainer_rate"), r.get("jockey_rate"),
                 r.get("confidence"), r.get("flag"), r.get("reason"),
                 frac_text(r.get("dec_best")), r.get("books"), r.get("mover_1h_pct"),
-                r.get("wwr_gap"), r.get("course_wins"), r.get("course_runs")]
+                r.get("wwr_gap"), r.get("course_wins"), r.get("course_runs"),
+                frac_text(r.get("night_best"))]
 
     if runners:
         write_tab(sh, "RUNNERS_TARGET", r_head, [rr(r) for r in runners])
@@ -1634,9 +1751,11 @@ def main():
     card = sorted((r for r in race_best if r["date"] >= recent), key=card_order)
     write_tab(sh, "BEST_PER_RACE", BEST_HEAD,
               [[r["date"], r["time"], r["course"], r["region"], r["horse"], r["odds_at_pick"],
-                r["model_prob"], r["value_edge"], r["form_score"], r["confidence"], r["reason"],
-                r["race_flag"], r["status"], r["position"], r["field_size"], r["sp"],
-                r["clv_pct"], r["won"], r["placed"], r["pnl_win_units"], r["pnl_place_units"]]
+                frac_text(to_float(r.get("night_dec"))), r["model_prob"], r["value_edge"],
+                r["form_score"], r["confidence"], r["reason"], r["race_flag"], r["status"],
+                r["position"], r["field_size"], r["places_paid"], r["sp"], r["clv_pct"],
+                r["night_clv_pct"], r["won"], r["placed"], r["pnl_win_units"],
+                r["pnl_place_units"], r["pick_rule"] or "edge"]
                for r in card])
     rhead, rrows = summarise(race_best, fav_best)
     write_tab(sh, "RACE_BEST_SUMMARY", rhead, rrows)
@@ -1675,11 +1794,16 @@ def main():
             ["runners_with_2h_ref", n2h], ["runners_with_night_ref", nnight],
             ["pending_bets", sum(1 for r in tracker if r["status"] == "PENDING")],
             ["settled_bets", sum(1 for r in tracker if r["status"] == "SETTLED")],
-            ["unmatched_bets", sum(1 for r in tracker if r["status"] == "UNMATCHED")],
+            ["non_runners", sum(1 for r in tracker if r["status"] == "NON-RUNNER")],
             ["race_best_picks_today", len(picks)], ["race_best_new", new_race_bests],
             ["race_best_pending", sum(1 for r in race_best if r["status"] == "PENDING")],
             ["race_best_settled", sum(1 for r in race_best if r["status"] == "SETTLED")],
-            ["race_best_unmatched", sum(1 for r in race_best if r["status"] == "UNMATCHED")],
+            ["race_best_non_runners", sum(1 for r in race_best if r["status"] == "NON-RUNNER")],
+            ["place_results_rechecked", rechecked],
+            ["bets_to_place_rule", f"win-focus (top model pick, win prob >= {MIN_WIN_PROB:.0%}, price <= {MAX_WIN_DEC})"
+             if WIN_FOCUS else "value edge"], ["best_per_race_rule", BEST_RULE],
+            ["runners_with_night_price_pct", round(100 * sum(1 for r in runners if r.get("night_best"))
+                                                   / len(runners)) if runners else 0],
             ["runners_with_form_pct", round(100 * sum(1 for r in runners if (r.get("runs_n") or 0) >= 2)
                                             / len(runners)) if runners else 0],
             ["runners_with_rating_pct", round(100 * sum(1 for r in runners if r.get("rating"))
