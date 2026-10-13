@@ -1407,12 +1407,12 @@ def formatting_requests(meta_sheets, specs=None):
 
 def apply_formatting(sh):
     meta = sh.fetch_sheet_metadata()
-    reqs = formatting_requests(meta.get("sheets", []))
+    reqs = formatting_requests(meta.get("sheets", [])) + guide_requests(meta.get("sheets", []))
     if reqs:
         sh.batch_update({"requests": reqs})
 
 
-VISIBLE_TABS = ["BEST_PER_RACE", "BETS_TO_PLACE", "RACE_BEST_SUMMARY", "RACE_BEST_TRACKER"]
+VISIBLE_TABS = ["BEST_PER_RACE", "BETS_TO_PLACE", "RACE_BEST_SUMMARY", "RACE_BEST_TRACKER", "GUIDE"]
 
 
 def tidy_tabs(sh):
@@ -1718,6 +1718,262 @@ def load_weights(sh):
 
 
 # ----------------------------------------------------------------------------
+# GUIDE tab: plain-English explanation of every tab and every column
+# ----------------------------------------------------------------------------
+GUIDE_HEAD = ["Section", "Name", "What it means (plain English)", "Why it matters / how to use it"]
+
+
+def guide_rows():
+    """Returns (header, rows, heading_row_indexes) for the GUIDE tab. Heading rows are shaded."""
+    rows, heads = [], []
+
+    def H(title):
+        heads.append(len(rows))
+        rows.append([title, "", "", ""])
+
+    def R(name, meaning, why=""):
+        rows.append(["", name, meaning, why])
+
+    H("1. START HERE: HOW THIS SHEET WORKS")
+    R("What this sheet does",
+      "A program runs about every 30 minutes during racing hours. It reads the day's racecards and bookmaker prices, rates every runner, and picks horses. After each race it reads the result and works out how every pick did using YOUR staking.",
+      "You get a live list of what to back, plus a running record of whether the picks really make money.")
+    R("The two pick lists",
+      "BEST_PER_RACE gives one pick in every race: the horse the model thinks is most likely to win. BETS_TO_PLACE is a much shorter list of stricter picks meant for real betting.",
+      "BEST_PER_RACE shows how good the model is across the board. BETS_TO_PLACE is where you would actually put money.")
+    R("Your staking",
+      "Price under 9/2: 5 euro to win. Price 9/2 or bigger: 2.50 euro each way (2.50 win + 2.50 place = 5 euro in total), with the place part paid at 1/5 of the odds. Every euro column in the sheet uses these rules.",
+      "This is how you really bet, so the euro columns are the most realistic measure of results.")
+    R("Green rows",
+      "Any row with a value_edge of 5% or more is shaded green.",
+      "Green means the model rates that horse at least 5 percentage points better than the market does. These are the strongest opinions.")
+    R("Picks can change until the off",
+      "While a race is still to run, its pick can change as prices and information change. Once the race is off, the pick is locked, and that locked pick is the one that is judged.",
+      "So a pick you saw early in the day may differ from the final one. Look at the latest run before betting.")
+    R("Hidden tabs",
+      "Most tabs are hidden to keep things tidy, but they all keep updating. To see one, use the View menu, then Hidden sheets, and pick the tab.",
+      "DASHBOARD is the one to unhide if something looks wrong.")
+    R("Small samples",
+      "A few hundred bets is a small sample. Horse racing is very random, so ROI can swing by 10 percentage points or more purely through luck.",
+      "Don't change your approach after a few bad days. Judge on 500+ bets, and also look at CLV, which settles down faster than ROI.")
+    R("No guarantees",
+      "The model is only an estimate. Bookmakers build a margin into every price, so most people lose over time.",
+      "Only bet what you can afford to lose.")
+
+    H("2. THE TABS YOU SEE")
+    R("BEST_PER_RACE", "Yesterday's and today's pick in every race, grouped by course with the races in time order. Shows the price you could take, the price the night before, the SP, the result and the euro profit.", "Your daily card. Green rows are the strongest edges.")
+    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, at 4/1 or shorter, in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model.", "Fewer bets, but aimed at winners rather than long shots.")
+    R("RACE_BEST_SUMMARY", "The scoreboard for all the picks in RACE_BEST_TRACKER: wins, places, ROI, CLV and euro profit, for everything together and split into groups (price, field size and so on).", "Start here to see how the picks are doing and where they win or lose.")
+    R("RACE_BEST_TRACKER", "The permanent log of every BEST_PER_RACE pick, one row per race, from the pick through to the result and the money won or lost.", "The raw record behind the summary. Check individual bets here.")
+    R("GUIDE", "This tab: what every tab and every column means, in plain English.", "Keep it handy. Anything not explained here is not part of the sheet.")
+
+    H("3. THE TABS THAT ARE HIDDEN (View > Hidden sheets)")
+    R("BET_TRACKER", "Same as RACE_BEST_TRACKER but for the BETS_TO_PLACE list.", "The record of your stricter real-betting picks.")
+    R("TRACKER_SUMMARY", "Same as RACE_BEST_SUMMARY but for BET_TRACKER.", "The scoreboard for the BETS_TO_PLACE list.")
+    R("FAV_BASELINE_TRACKER", "A log of 'just back the favourite in every race', staked the same way as your bets.", "The yardstick. If the picks can't beat simply backing favourites, the model isn't adding anything.")
+    R("RUNNERS_TARGET", "Every runner in every race still to come, with its price and all the model numbers.", "The full list behind the picks.")
+    R("SIGNALS", "The same runners sorted with the biggest edge at the top, plus shorten_score.", "Quick way to see which horses the model likes most.")
+    R("VALUE_BETS_TARGET", "Only runners whose edge is at least the minimum (2% by default), biggest first.", "Horses the model rates clearly above the market.")
+    R("RACES_TARGET", "The races found for the day and how many runners had prices.", "A quick check that every meeting was picked up.")
+    R("MARKET_MOVERS_1H", "Horses whose price has moved by 5% or more compared with about an hour ago.", "Late money is often the most informative.")
+    R("MARKET_MOVERS_2H", "Horses whose price has moved by 5% or more compared with about two hours ago.", "Same idea over a longer window.")
+    R("MARKET_MOVERS", "Horses whose price has moved by 5% or more compared with the first price of the day (the evening before when available).", "Shows overnight and all-day support or doubt.")
+    R("MARKET_SNAPSHOTS_LOG", "A price snapshot of every runner each time the program runs.", "Needed to work out the movers. Grows over time.")
+    R("RUNNER_LOG", "Every runner's information (price, form, rating and so on) recorded shortly before the off.", "Research data. Lets the program test whether its ratings are accurate.")
+    R("RUNNER_RESULTS", "How each logged runner finished, with the starting price.", "Joined to RUNNER_LOG to check the model against real results.")
+    R("MODEL_CALIBRATION", "A report card for the model's percentages: did horses rated at 20% win about 20% of the time? Does the model beat the market?", "Fills in as results arrive. Updated on the late run each night.")
+    R("WEIGHTS", "How much each factor counts in the model, and (after 300+ races) what the data suggests instead.", "Shows whether the model's settings should change.")
+    R("TARGET_DAY", "Which day the latest run was working on, and when.", "After the last race of the day it moves on to tomorrow.")
+    R("DASHBOARD", "A health check of the latest run: how many races and runners were found, how many results were settled, warnings and the euro profit so far.", "Unhide this first if something looks wrong.")
+    R("RUN_LOG", "One row for every run of the program, with a status.", "Shows whether runs are happening and whether any failed.")
+
+    H("4. THE SCOREBOARD COLUMNS (RACE_BEST_SUMMARY and TRACKER_SUMMARY)")
+    R("Segment", "Which group of bets the row covers, for example ALL BETS or Odds 4/1-9/1 or Field 13+.", "Compare groups to see where the picks do well or badly.")
+    R("Bets", "How many finished bets are in the group. Non-runners and bets still to run are not counted.", "Small groups (under about 40 bets) are mostly luck, so don't read much into them.")
+    R("Wins", "How many of those bets won.", "")
+    R("Win %", "The share of bets that won, often called the strike rate. 25% means 1 winner in every 4 bets.", "Higher is nicer, but a high strike rate on short prices can still lose money.")
+    R("Places", "How many bets finished in the paid places, including winners. Places depend on the field: 5 to 7 runners pay 2 places, 8 or more pay 3, big handicaps (16+) pay 4, and 4 or fewer runners have no place betting.", "")
+    R("Place %", "The share of bets that placed.", "Shows how often a horse is at least in the money.")
+    R("Win P&L (units)", "Profit or loss if you had put 1 unit to win on every bet at the starting price (SP). A unit is just a measuring stick, not euro.", "Older style measure kept for comparison. The euro columns are closer to real life.")
+    R("Win ROI %", "ROI for those 1-unit win bets. ROI means Return On Investment: total profit divided by total staked. For example, staking 100 in total and ending 7.80 down is an ROI of -7.8%.", "Above 0% means money made, below 0% means money lost. It is the single most important number, but it needs lots of bets to be trusted.")
+    R("Place P&L (units)", "Profit or loss if you had put 1 unit on every bet to place only, at the SP, using normal place terms.", "")
+    R("Place ROI %", "ROI for those place-only bets.", "Place-only bets on short prices pay very little, so this is often negative even when a horse places a lot.")
+    R("Avg CLV %", "Average closing line value. For each bet: the price you could take when the pick was made divided by the SP, minus 1. Positive means you got a bigger price than the horse went off at.", "Beating the SP regularly is a good sign the picks are finding horses the market later agrees with. It settles down faster than ROI.")
+    R("Avg night CLV %", "The same idea, but using the best bookmaker price from the evening before instead of the price at pick time.", "Shows whether betting the night before would have beaten the SP. Only filled in once night prices are being recorded.")
+    R("Staked €", "Total euro put on, using your staking: 5 euro win under 9/2, or 2.50 each way (5 in total) from 9/2 up.", "The 'money in'.")
+    R("P&L €", "Total euro profit or loss using your staking and the price you took.", "The 'money out' minus the 'money in'.")
+    R("ROI % (my staking)", "P&L € divided by Staked €. Total profit as a percentage of the money you put on, using how you really bet.", "This is the most realistic ROI. 10% means 10 euro profit for every 100 euro staked.")
+    R("ROI at SP % (my staking)", "The same, but as if every bet had been taken at the starting price instead of the price at pick time.", "Compare with the line above. If this is much lower, you rely on beating the SP to make money.")
+
+    H("5. THE ROWS IN THE SCOREBOARD (the groups)")
+    R("ALL BETS", "Every finished bet together.", "The headline result.")
+    R("BASELINE: favourite, same races", "What you would have got backing the favourite in the same races, staked the same way. Only races that have a settled favourite record are included.", "The yardstick the picks need to beat.")
+    R("Edge <3%, 3-5%, 5%+", "Bets grouped by how much the model liked the horse above the market when the pick was made.", "If bigger edges do better, the model is working. If not, edge isn't telling us much.")
+    R("Odds groups", "Bets grouped by the starting price: under 3/2, 3/2 to 4/1, 4/1 to 9/1, and 9/1 or more.", "Shows which price range is making or losing money. Note that CLV in these groups is skewed, because the groups are chosen using the SP.")
+    R("Field groups", "Bets grouped by number of runners: under 8, 8 to 12, 13 or more.", "Big fields are harder to predict.")
+    R("Race OK / Race flagged", "Races with no warning flag, versus races flagged as big-field handicaps or ones with many lightly-raced horses.", "Shows whether the warning flags are really warning of anything.")
+    R("Region: gb / ire", "Britain versus Ireland.", "")
+    R("Price shortened / drifted", "Bets where the SP was shorter than the price taken (shortened, CLV positive), versus longer (drifted, CLV negative).", "Horses that drift tend to do worse, which is the market telling us something.")
+    R("Pick rule groups", "Bets grouped by the method that chose them: edge (older picks, biggest value), prob (most likely winner), win-focus (BETS_TO_PLACE shortlist), fav (favourite).", "Lets you compare picking methods fairly on the same sheet.")
+    R("Status counts", "The last line counts rows by status: PENDING (race not finished), SETTLED, NON-RUNNER and NO_RESULT.", "")
+
+    H("6. COLUMNS IN BEST_PER_RACE AND THE TRACKERS")
+    R("key", "A unique ID for the bet (date, course, time and horse).", "Stops the same bet being logged twice.")
+    R("date", "The race date.", "")
+    R("course", "The racecourse.", "")
+    R("time", "The off time as four digits, for example 1530 is 3:30pm.", "")
+    R("region", "gb for Britain or ire for Ireland.", "")
+    R("horse", "The horse picked.", "")
+    R("odds", "The price when the pick was made, as fractions (for example 9/2). It is the best bookmaker price we could find, or the Probable SP if bookmaker prices weren't available.", "The price you would have taken.")
+    R("odds_at_pick", "Same as odds, as stored in the tracker.", "")
+    R("dec_at_pick", "The price at pick time in decimal form (9/2 is 5.5, evens is 2.0).", "Used for the maths. Decimal price = stake returned per 1 staked including the stake.")
+    R("night_price", "The best bookmaker price from the evening before the race, as fractions.", "Shows how the price moved overnight. Blank if bookmakers hadn't priced the race by the late run.")
+    R("night_dec", "The night-before price in decimal form.", "Used to work out night CLV.")
+    R("model_prob", "The model's chance that the horse wins, as a percentage. 30% is roughly 2/1.", "Compare with fair_prob. The gap is the edge.")
+    R("value_edge", "model_prob minus fair_prob, in percentage points. 5% means the model rates the horse 5 points better than the market does.", "Bigger means the model disagrees with the market more. 5% or more turns the row green.")
+    R("form_score", "A 0 to 1 score for the horse's last three runs, counting the latest most (50%, then 30%, then 20%). 1 means it won, 0.5 means mid-field, 0.1 means pulled up or fell.", "Higher is better recent form.")
+    R("confidence", "The share of runners in the race that have at least 2 previous runs.", "Low confidence means many unraced or lightly raced horses, so the form is less reliable.")
+    R("reason", "The two things pushing the model's rating of this horse up the most, for example 'form +0.23, c&d +0.07'.", "A quick 'why'. The numbers are the size of the push in the model's own units.")
+    R("race_flag", "A warning: BIG-FIELD HCAP (a handicap with 16 or more runners) or MANY UNRACED (fewer than 70% of runners have 2 or more runs). Blank means no warning.", "These races are harder to predict. BETS_TO_PLACE skips them.")
+    R("status", "On bets: PENDING means the race isn't finished, SETTLED means the result is in, NON-RUNNER means the horse wasn't in the race, NO_RESULT means no result could be found after 2 days. In RUN_LOG and DASHBOARD it describes the run itself (OK, OK WITH WARNINGS, NO RACES LEFT and so on).", "Only SETTLED bets count in the scoreboard.")
+    R("position", "Where the horse finished. DNF means it didn't finish (pulled up, fell and so on).", "")
+    R("field_size", "How many horses actually ran.", "Decides how many places are paid.")
+    R("places_paid", "How many places count for the place part of an each-way bet in that race.", "5 to 7 runners pay 2 places, so a third there does not place.")
+    R("sp", "The starting price, the official price at the off, as fractions.", "The final market price. It is the yardstick for CLV.")
+    R("sp_dec", "The starting price in decimal form.", "")
+    R("won", "1 if the horse won, otherwise 0.", "")
+    R("placed", "1 if the horse finished in the paid places, otherwise 0. Winners count as placed.", "")
+    R("pnl_win_units", "Profit or loss in units for a 1-unit win bet at the SP.", "Older measure, kept for comparison.")
+    R("pnl_place_units", "Profit or loss in units for a 1-unit place-only bet at the SP.", "")
+    R("clv_pct", "Closing line value for this bet: price at pick time divided by SP, minus 1, as a percentage.", "Positive means the price shortened after the pick (good).")
+    R("night_clv_pct", "Same, but using the night-before price.", "Positive means the price shortened after the night before.")
+    R("bet_type", "WIN 5 means a 5 euro win bet. EW 2.50 means 2.50 each way. 'No place market' means the race had 4 or fewer runners, so only the win half is staked.", "Chosen from the price taken: under 9/2 is a win bet, 9/2 or bigger is each way.")
+    R("stake_eur", "Euro staked on the bet (5, or 2.50 in a field of 4 or fewer). Non-runners are 0.", "")
+    R("pnl_eur", "Euro profit or loss at the price you could take when the pick was made. Each-way bets pay the win part at full odds and the place part at 1/5 of the odds.", "Your realistic result for the bet.")
+    R("pnl_eur_sp", "Euro profit or loss if the same bet had been placed at the starting price.", "Shows how much depends on getting the earlier price.")
+    R("pick_rule", "The method that chose the pick: prob, edge, win-focus or fav. Blank on very old rows means edge.", "Lets you compare methods.")
+    R("price_src", "Where the pick price came from, for example 'best of 12 books' or 'probable SP'.", "Bookmaker prices are the real ones. Probable SP is only an estimate.")
+    R("declared", "How many runners were declared when the pick was made.", "Used to avoid counting too many runners when working out places.")
+    R("nr_note", "For a non-runner: a note saying the horse wasn't on the result page, and which name there was closest.", "Check it if you think a horse did run. A near match means a spelling problem, not a non-runner.")
+    R("rules_v", "An internal version number for how places were worked out.", "Ignore. It lets the program re-check older results once.")
+    R("settled_at", "When the result was recorded.", "")
+
+    H("7. EXTRA COLUMNS IN THE RUNNER TABS (RUNNERS_TARGET, SIGNALS, VALUE_BETS_TARGET, BETS_TO_PLACE)")
+    R("dec", "The market price in decimal form: the middle (median) bookmaker price, or the Probable SP if bookmaker prices weren't available.", "Used for the market's view.")
+    R("fair_prob", "The market's chance for the horse, as a percentage, after removing the bookmakers' margin so all the runners add up to 100%.", "Compare with model_prob.")
+    R("ev", "Expected value: model_prob times the best price, minus 1. 5% means the model expects 5 cents profit per euro staked, if it is right.", "Positive means value at the best price available. The model can be wrong, so treat it as a guide.")
+    R("mover_1h_pct", "How far the price has moved in the last hour, as a percentage. Negative means shortened (more support), positive means drifted.", "-20% means the price got a fifth shorter.")
+    R("mover_2h_pct", "The same over about two hours.", "")
+    R("mover_night_pct", "The same since the first price of the day (the evening before when available).", "")
+    R("shorten_score", "A single number for how much the price has shortened recently (larger means more support).", "Handy for sorting in SIGNALS.")
+    R("rating", "The horse's official rating (higher means better).", "The model compares it with the rest of the field.")
+    R("days_off", "Days since the horse last ran.", "Over 90 days off counts against a horse.")
+    R("trainer_rate", "The trainer's win rate over the last 21 days, smoothed so small samples don't mislead.", "A hot trainer is a small positive.")
+    R("jockey_rate", "The jockey's win rate over the last 21 days, smoothed in the same way.", "")
+    R("best_price", "The biggest price any bookmaker is offering for the horse.", "Where to bet.")
+    R("books", "How many bookmakers' prices the market price was based on.", "More bookmakers means a more reliable price.")
+    R("wwr_gap", "The horse's best winning mark minus today's rating, in 10lb units. Positive means it is rated below the mark it has won off.", "Positive is a small plus.")
+    R("course_wins", "How many times the horse has won at this course.", "")
+    R("course_runs", "How many times the horse has run at this course.", "")
+
+    H("8. COLUMNS IN THE RESEARCH AND LOG TABS")
+    R("logged_at", "When the runner's information was recorded.", "")
+    R("dec_market", "The market (median bookmaker) price in decimal form when logged.", "")
+    R("dec_best", "The best bookmaker price in decimal form when logged.", "")
+    R("src", "Where the market price came from: b for bookmakers, p for Probable SP.", "Price moves are only compared like with like.")
+    R("runs_n", "How many previous runs were found for the horse.", "Horses with fewer than 2 are treated as lightly raced.")
+    R("cd", "Course and distance record: 1 means it has won at this course and distance, 0.5 means it has won at the course or the distance, 0 means neither.", "")
+    R("bf", "1 if the horse was beaten as favourite last time.", "The model learns whether that matters.")
+    R("weight_lb", "The weight the horse carries today, in pounds.", "Recorded for research.")
+    R("flag", "The race flag at the time of logging (see race_flag).", "")
+    R("handicap", "Whether the race is a handicap.", "")
+    R("ts", "The time of a price snapshot.", "")
+    R("dec_price", "The market price in decimal form in a snapshot.", "")
+    R("ref_move_pct", "In the movers tabs: how far the price has moved against the earlier price, as a percentage.", "")
+    R("direction", "In the movers tabs: shortening or drifting.", "")
+    R("url", "The web page the race was read from.", "")
+    R("runners", "In RACES_TARGET and RUN_LOG: how many runners were found.", "")
+    R("priced", "How many of those runners had a price.", "Should be nearly all of them.")
+    R("races", "In RUN_LOG: how many races were found in that run. In WEIGHTS: how many races were used for the fit.", "")
+    R("bets", "In RUN_LOG: how many bets were selected in that run.", "")
+    R("run_time", "When the run happened.", "")
+    R("target_day", "The racing day the run was working on.", "")
+    R("generated", "When TARGET_DAY was last written.", "")
+
+    H("9. COLUMNS IN WEIGHTS AND MODEL_CALIBRATION")
+    R("feature", "In WEIGHTS: a factor the model uses, such as form, rating, trainer, jockey, cd (course and distance), layoff, move, move1h, wwr, course and bf. 'market' is how much the model trusts the market price.", "")
+    R("current", "In WEIGHTS: how much that factor counts at the moment.", "Bigger means a bigger push on the horse's rating.")
+    R("fitted", "In WEIGHTS: what the data suggests the number should be, worked out from your own results once 300+ races are logged.", "Blank until there is enough data.")
+    R("apply", "In WEIGHTS: 1 means the fitted numbers beat the current ones in a fair test and can be switched on (the USE_FITTED_WEIGHTS setting). 0 means keep the current ones.", "")
+    R("needed", "In WEIGHTS: how many races are needed before fitting starts.", "")
+    R("cv_loss_current", "In WEIGHTS: how well the current numbers predicted winners in a cross-check (lower is better).", "Cross-check means each race is scored using numbers that never saw that race, so the test is fair.")
+    R("cv_loss_fitted", "In WEIGHTS: the same for the fitted numbers.", "If this is lower than cv_loss_current, the fitted numbers are better.")
+    R("updated", "In WEIGHTS: when the fit was last done.", "")
+    R("Calibration table", "In MODEL_CALIBRATION: groups horses by the model's percentage and shows how often they really won. 'Avg model %' should be close to 'Actual win %'.", "If horses rated 20% win only 12%, the model is overconfident.")
+    R("Log loss", "In MODEL_CALIBRATION: a score for how much probability the model (and the market) gave to the horse that actually won. Lower is better.", "If the model's score is lower than the market's, the model beats the market.")
+    R("Verdict", "In MODEL_CALIBRATION: MODEL BEATS MARKET or NOT YET.", "The honest test of whether the extra information is helping.")
+
+    H("10. BETTING WORDS EXPLAINED")
+    R("SP (starting price)", "The official price a horse goes off at when the race starts.", "")
+    R("Probable SP", "A forecast of the starting prices published on the racecard before the race.", "An estimate, not a price you can bet at.")
+    R("Fractional and decimal odds", "9/2 means win 9 for every 2 staked. In decimal the same price is 5.5 (the 5.5 includes your stake coming back).", "The sheet shows fractions for reading and decimals for the maths.")
+    R("Each way", "Two bets in one: half on the horse to win and half on it to place. The place part pays a fraction of the odds (1/5 here) if the horse finishes in the places.", "Each way softens the loss on big-priced horses that run well.")
+    R("Place terms", "How many places are paid and what fraction of the odds. Here: 2 places for 5 to 7 runners, 3 for 8 or more, 4 for big handicaps (16+); no place betting for 4 or fewer runners.", "A horse finishing 3rd in a 7-runner race does not place.")
+    R("Non-runner", "A horse that doesn't take part. Your stake is returned, so it isn't counted as a bet.", "")
+    R("Favourite", "The horse with the shortest price in the race.", "")
+    R("Handicap", "A race where better horses carry more weight to even things up.", "Harder to predict, especially with big fields.")
+    R("Market margin (overround)", "Bookmaker prices imply chances that add up to more than 100%. The extra is their profit margin.", "It's why fair_prob is lower than the price suggests.")
+    R("Edge", "How much better the model rates a horse than the market does (see value_edge).", "")
+    R("Strike rate", "The share of bets that win (Win %).", "")
+    R("CLV (closing line value)", "Whether you beat the final price. See Avg CLV %.", "A good early sign when there aren't many results yet.")
+    R("Units and euro", "A unit is just a measuring stick (1 unit staked per bet). Euro columns use your real staking.", "Use the euro columns for the real picture.")
+
+    H("11. SETTINGS YOU CAN CHANGE (GitHub: Settings > Secrets and variables > Actions)")
+    R("REGION", "all, gb or ire. Which countries to include.", "")
+    R("WIN_FOCUS", "1 (the default) makes BETS_TO_PLACE back only the model's top-rated horse. 0 uses the older biggest-value-edge method.", "")
+    R("MAX_WIN_DEC", "The biggest decimal price allowed for BETS_TO_PLACE. 5.0 is 4/1.", "Lower means shorter prices and more winners.")
+    R("MAX_FIELD", "The most runners allowed in a BETS_TO_PLACE race. 12 by default.", "")
+    R("MIN_WIN_PROB", "The smallest model win chance allowed for BETS_TO_PLACE. 0.25 means 25%.", "")
+    R("BEST_RULE", "prob (default) makes BEST_PER_RACE pick the likeliest winner. edge picks the biggest value instead.", "")
+    R("MIN_VALUE_EDGE", "The smallest edge for the older value method and for VALUE_BETS_TARGET. 0.02 means 2%.", "")
+    R("MIN_EV", "The smallest expected value at the best price. Left empty it isn't applied in win-focus mode.", "")
+    R("STRICT_FILTERS", "1 (default) makes BETS_TO_PLACE skip flagged races and horses with fewer than 2 previous runs.", "")
+    R("AUTO_FILTER", "1 (default) lets the program switch off groups that have clearly lost over 40+ bets.", "")
+    R("USE_FITTED_WEIGHTS", "1 lets the model use the weights fitted from your own results once they have beaten the current ones in a fair test.", "Off by default.")
+    R("LOG_WINDOW_MIN", "How many minutes before the off a race's information is saved for research. 35 by default.", "Use 65 if you run hourly instead of every 30 minutes.")
+    R("MAX_FIELD_HCAP", "A handicap with this many runners or more gets the BIG-FIELD HCAP flag. 16 by default.", "")
+    return GUIDE_HEAD, rows, heads
+
+
+def guide_requests(meta_sheets):
+    """Layout for the GUIDE tab: wrapped text, sensible column widths, shaded section headings."""
+    reqs = []
+    head, rows, heads = guide_rows()
+    for m in meta_sheets:
+        props = m.get("properties", {})
+        if props.get("title") != "GUIDE":
+            continue
+        sid, n = props.get("sheetId"), len(rows) + 1
+        reqs.append({"updateSheetProperties": {"properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": 1}},
+                                               "fields": "gridProperties.frozenRowCount"}})
+        for i, w in enumerate((170, 210, 560, 440)):
+            reqs.append({"updateDimensionProperties": {
+                "range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                "properties": {"pixelSize": w}, "fields": "pixelSize"}})
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": n, "startColumnIndex": 0, "endColumnIndex": 4},
+            "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "TOP"}},
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)"}})
+        for r in [0] + [h + 1 for h in heads]:
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": r, "endRowIndex": r + 1, "startColumnIndex": 0, "endColumnIndex": 4},
+                "cell": {"userEnteredFormat": {"textFormat": {"bold": True},
+                                               "backgroundColor": {"red": 0.85, "green": 0.89, "blue": 0.95}}},
+                "fields": "userEnteredFormat(textFormat,backgroundColor)"}})
+    return reqs
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 def main():
@@ -1926,6 +2182,11 @@ def main():
     write_tab(sh, "DASHBOARD", ["item", "value"], dash)
     append_rows(sh, "RUN_LOG", ["run_time", "target_day", "races", "runners", "bets", "status"],
                 [[stamp, day.isoformat(), len(races), len(runners), len(bets), status]])
+    try:
+        ghead, grows, _ = guide_rows()
+        write_tab(sh, "GUIDE", ghead, grows)
+    except Exception as ex:                     # the guide is a convenience, never fail the run for it
+        log(f"  could not write the guide tab: {ex}")
     try:
         apply_formatting(sh)
     except Exception as ex:                     # cosmetic only, never fail the run for it
