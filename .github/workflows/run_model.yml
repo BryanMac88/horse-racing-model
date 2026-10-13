@@ -3,7 +3,7 @@ name: Run horse racing model
 on:
   schedule:
     - cron: "*/30 6-21 * * *"   # every 30 min during racing hours (UTC)
-    - cron: "15 22 * * *"       # late run: settles results, then targets tomorrow
+    - cron: "15 22 * * *"       # late run: settles results, runs the analysis, targets tomorrow
   workflow_dispatch: {}
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +30,17 @@ jobs:
           SHEET_NAME: ${{ secrets.SHEET_NAME }}
           REGION: ${{ secrets.REGION }}
           MIN_VALUE_EDGE: ${{ secrets.MIN_VALUE_EDGE }}
+          # optional settings: leave the secret unset to use the default
+          MIN_EV: ${{ secrets.MIN_EV }}
+          STRICT_FILTERS: ${{ secrets.STRICT_FILTERS }}
+          AUTO_FILTER: ${{ secrets.AUTO_FILTER }}
+          USE_FITTED_WEIGHTS: ${{ secrets.USE_FITTED_WEIGHTS }}
+          LOG_WINDOW_MIN: ${{ secrets.LOG_WINDOW_MIN }}
+          MAX_FIELD_HCAP: ${{ secrets.MAX_FIELD_HCAP }}
+          WIN_FOCUS: ${{ secrets.WIN_FOCUS }}
+          MIN_WIN_PROB: ${{ secrets.MIN_WIN_PROB }}
+          MAX_WIN_DEC: ${{ secrets.MAX_WIN_DEC }}
+          BEST_RULE: ${{ secrets.BEST_RULE }}
           DEBUG_DUMP: "1"
         run: python horse_model.py
 
