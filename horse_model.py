@@ -29,11 +29,13 @@ Environment variables
   WIN_FOCUS       1 (default) = BETS_TO_PLACE backs only the model's top-rated horse in a race, aiming
                   for winners rather than value; 0 = the older value-edge selection
   MIN_WIN_PROB    win-focus: minimum model win probability, default 0.25
-  MAX_WIN_DEC     win-focus: maximum decimal price, default 6.0 (5/1)
+  MAX_WIN_DEC     win-focus: maximum decimal price, default 5.0 (4/1)
+  MAX_FIELD       win-focus: skip races with more declared runners than this, default 12
   BEST_RULE       prob (default) = BEST_PER_RACE picks the horse most likely to win; edge = biggest value edge
   DEBUG_DUMP      set to 1 to save fetched pages into ./debug (uploaded by the workflow)
 """
 import datetime as dt
+import difflib
 import json
 import math
 import os
@@ -64,7 +66,8 @@ MIN_EV = float(os.environ.get("MIN_EV") or 0.0)
 MIN_EV_SET = bool(os.environ.get("MIN_EV"))
 WIN_FOCUS = (os.environ.get("WIN_FOCUS") or "1") != "0"
 MIN_WIN_PROB = float(os.environ.get("MIN_WIN_PROB") or 0.25)
-MAX_WIN_DEC = float(os.environ.get("MAX_WIN_DEC") or 6.0)
+MAX_WIN_DEC = float(os.environ.get("MAX_WIN_DEC") or 5.0)
+MAX_FIELD = int(os.environ.get("MAX_FIELD") or 12)
 BEST_RULE = (os.environ.get("BEST_RULE") or "prob").strip().lower()
 PLACE_RULES_V = "2"                # bumped when place settlement changed; older rows are re-checked
 AUTO_FILTER = (os.environ.get("AUTO_FILTER") or "1") != "0"
@@ -813,6 +816,7 @@ def choose_bets(runners, blocked=()):
         if WIN_FOCUS:
             ok = (r.get("model_rank") == 1 and r["model_prob"] >= MIN_WIN_PROB
                   and 1.5 <= r["dec"] <= MAX_WIN_DEC and r["value_edge"] >= 0
+                  and (not r.get("declared") or r["declared"] <= MAX_FIELD)
                   and (r.get("form_score") is None or r["form_score"] >= 0.40)
                   and (r.get("days_off") is None or r["days_off"] <= 90))
             if ok and MIN_EV_SET and r.get("dec_best") and r["ev"] < MIN_EV:
@@ -920,7 +924,7 @@ TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pic
                 "field_size", "places_paid", "sp", "sp_dec", "won", "placed",
                 "pnl_win_units", "pnl_place_units", "settled_at",
                 "form_score", "confidence", "reason", "race_flag", "clv_pct", "price_src",
-                "declared", "rules_v", "night_dec", "night_clv_pct", "pick_rule"]
+                "declared", "rules_v", "night_dec", "night_clv_pct", "pick_rule", "nr_note"]
 
 
 def field_count(entries, declared=None):
@@ -942,11 +946,22 @@ def settle_row(row, finishers, handicap, now):
     names = [e["norm"] for e in runners]
     target = norm(row["horse"])
     if target not in names:
-        if sum(1 for e in runners if e.get("pos") is not None) >= 3:
+        if sum(1 for e in runners if e.get("pos") is not None) < 3:
+            return                              # page not clear enough to say: try again next run
+        close = difflib.get_close_matches(target, names, n=1, cutoff=0.88)
+        if close:
+            target = close[0]                   # same horse, spelled slightly differently
+        else:
+            best, ratio = "", 0.0
+            for e in runners:
+                q = difflib.SequenceMatcher(None, target, e["norm"]).ratio()
+                if q > ratio:
+                    best, ratio = e["name"], q
             row.update({"status": "NON-RUNNER", "pnl_win_units": 0, "pnl_place_units": 0,
                         "won": "", "placed": "", "rules_v": PLACE_RULES_V,
+                        "nr_note": f"not on the result page; closest name there: {best} ({ratio:.2f})",
                         "settled_at": now.isoformat(timespec="minutes")})
-        return                                  # page not clear enough to say: try again next run
+            return
     i = names.index(target)
     e = runners[i]
     field = field_count(finishers, row.get("declared"))
@@ -975,6 +990,9 @@ def recheck_places(rows, now, limit=150):
     result page with the corrected field size / place terms. A row is only changed if the re-settle works."""
     todo, done = [], 0
     for r in rows:
+        if r.get("status") == "NON-RUNNER" and not r.get("nr_note"):
+            todo.append(r)                      # older non-runners: re-test with the name fallback, add a note
+            continue
         if r.get("status") != "SETTLED" or str(r.get("rules_v")) == PLACE_RULES_V:
             continue
         pos = to_float(r.get("position"))
@@ -997,6 +1015,8 @@ def recheck_places(rows, now, limit=150):
             if res is None:
                 if now > race_off(day, r["time"]) + dt.timedelta(days=21):
                     r["rules_v"] = PLACE_RULES_V          # page long gone: keep what we had
+                    if r.get("status") == "NON-RUNNER" and not r.get("nr_note"):
+                        r["nr_note"] = "result page no longer available"
                 continue
             trial = dict(r)
             settle_row(trial, res[0], res[1], now)
@@ -1005,6 +1025,8 @@ def recheck_places(rows, now, limit=150):
                 done += 1
             elif trial.get("status") == "NON-RUNNER":
                 r.update(trial)
+            elif r.get("status") == "NON-RUNNER":
+                r["nr_note"] = "result page not clear enough to check"
     return done
 
 
