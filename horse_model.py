@@ -96,6 +96,7 @@ FEATURES = ["form", "rating", "trainer", "jockey", "cd", "layoff", "move", "move
 MOVER_MIN_AGE_MIN = 20             # a snapshot must be at least this old to be a reference
 MOVER_SHOW_PCT = 5.0               # show movers of at least this size
 REQUEST_PAUSE = 0.4                # seconds between page requests
+BOOK_COVER_MIN = 0.6               # bookmaker prices are used for a race when they cover this share of runners
 
 DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 MON3 = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -451,7 +452,8 @@ def parse_odds_compare(html, known=()):
                 decs = [d for d in decs if med / 1.6 <= d <= med * 1.6]
             if len(decs) >= 3:
                 med = decs[len(decs) // 2]
-                out[norm(display_name(cells[j]))] = {"best": max(decs), "median": med, "books": len(decs)}
+                out[norm(display_name(cells[j]))] = {"best": max(decs), "median": med, "books": len(decs),
+                                                     "mean": sum(decs) / len(decs)}
     return out
 
 
@@ -600,18 +602,24 @@ def scrape_day(day, now, warnings):
             continue
         entries, rinfo = parse_racecard(html, day)
         entries = [e for e in entries if not e["nr"]]
-        books = {}
+        books_all = {}
         ohtml = get(url.replace("/racecards/", "/odds-comparison/"))
         if ohtml:
-            books = parse_odds_compare(ohtml, {e["norm"] for e in entries})
-            if sum(1 for e in entries if e["norm"] in books) < 0.8 * max(len(entries), 1):
-                books = {}                 # patchy coverage would mix two price sources in one race
+            books_all = parse_odds_compare(ohtml, {e["norm"] for e in entries})
+        covered = sum(1 for e in entries if e["norm"] in books_all)
+        # bookmaker prices run the race when they cover most of the field (the rest keep the Probable SP);
+        # with thin coverage the whole race stays on the Probable SP, but the prices we did see are still
+        # remembered for the night-before record.
+        books = books_all if covered >= BOOK_COVER_MIN * max(len(entries), 1) else {}
         for e in entries:
             b = books.get(e["norm"])
+            ba = books_all.get(e["norm"])
             e["dec_sp"] = e["dec"]
-            e["dec_best"], e["books"], e["src"] = None, 0, "p"
+            e["dec_best"], e["books"], e["src"], e["dec_mv"] = None, 0, "p", e["dec"]
+            e["book_best_any"] = ba["best"] if ba else None
             if b:
-                e["dec"], e["dec_best"], e["books"], e["src"] = b["median"], b["best"], b["books"], "b"
+                e["dec"], e["dec_best"], e["books"], e["src"], e["dec_mv"] = (
+                    b["median"], b["best"], b["books"], "b", b["mean"])
                 e["odds"] = frac_text(b["median"])
         priced = [e for e in entries if e["dec"]]
         per_meeting[course][0] += 1
@@ -628,7 +636,8 @@ def scrape_day(day, now, warnings):
                       "time": hhmm, "url": url, "runners": len(entries), "priced": len(priced),
                       "handicap": rinfo["handicap"], "declared": declared,
                       "confidence": round(conf, 2), "flag": flag,
-                      "price_src": "bookmakers" if books else "probable SP"})
+                      "price_src": "bookmakers" if books else "probable SP",
+                      "books_cover": f"{covered} of {len(entries)}"})
         if len(priced) < 2:
             warnings.append(f"{course} {hhmm}: only {len(priced)} priced runners parsed")
             continue
@@ -645,7 +654,8 @@ def scrape_day(day, now, warnings):
                             "src": e["src"], "declared": declared, "handicap": rinfo["handicap"],
                             "wwr_gap": e["wwr_gap"], "course_wins": e["course_wins"],
                             "course_runs": e["course_runs"], "bf": e["bf"],
-                            "weight_lb": e["weight_lb"]})
+                            "weight_lb": e["weight_lb"], "dec_mv": e["dec_mv"],
+                            "book_best_any": e["book_best_any"]})
     return races, runners, per_meeting, info
 
 
@@ -656,47 +666,65 @@ def snap_key(date, course, hhmm, horse):
     return f"{date}|{norm(course)}|{hhmm}|{norm(horse)}"
 
 
-def _same_src(h, src):
-    return src is None or (h[2] if len(h) > 2 else "p") == src
+def _val(h, src):
+    """The comparable price in a snapshot: for bookmaker snapshots the average bookmaker price (older
+    snapshots that lack it cannot be compared); for Probable SP snapshots the price itself.
+    None if the snapshot is from a different price source."""
+    hs = h[2] if len(h) > 2 else "p"
+    if src is not None and hs != src:
+        return None
+    if hs == "b":
+        return (h[4] if len(h) > 4 else None) or None
+    return h[1]
 
 
 def pick_ref(hist, now, target_min=120, lo=MOVER_MIN_AGE_MIN, hi=300, src=None):
-    """Snapshot closest to `target_min` minutes ago, within [lo, hi] minutes old."""
+    """Price from the snapshot closest to `target_min` minutes ago, within [lo, hi] minutes old."""
     best = None
     for h in hist:
-        if not _same_src(h, src):
+        v = _val(h, src)
+        if v is None:
             continue
         age = (now - h[0]).total_seconds() / 60
         if lo <= age <= hi:
             d = abs(age - target_min)
             if best is None or d < best[0]:
-                best = (d, h[1])
+                best = (d, v)
     return best[1] if best else None
 
 
 def pick_open(hist, now, lo=MOVER_MIN_AGE_MIN, src=None):
-    """Earliest snapshot of the day that is at least `lo` minutes old."""
-    old = [(h[0], h[1]) for h in hist
-           if _same_src(h, src) and (now - h[0]).total_seconds() / 60 >= lo]
+    """Price from the earliest snapshot of the day that is at least `lo` minutes old."""
+    old = [(h[0], _val(h, src)) for h in hist
+           if _val(h, src) is not None and (now - h[0]).total_seconds() / 60 >= lo]
     return min(old)[1] if old else None
 
 
 def pick_night_best(hist, race_day):
     """Best bookmaker price from the last snapshot taken the evening before the race, else None."""
-    cand = [h for h in hist if len(h) > 3 and h[3] and h[2] == "b" and h[0].date() < race_day]
+    cand = [h for h in hist if len(h) > 3 and h[3] and h[0].date() < race_day]
     return max(cand, key=lambda h: h[0])[3] if cand else None
 
 
 def add_movers(runners, snaps, now):
+    """Price moves in %, negative = shortened. Only real bookmaker prices are compared (a Probable SP
+    forecast does not move, so those horses get blanks, not a misleading 0)."""
     for r in runners:
         hist = snaps.get(snap_key(r["date"], r["course"], r["time"], r["horse"]), [])
         r["night_best"] = pick_night_best(hist, dt.date.fromisoformat(r["date"]))
         src = r.get("src", "p")
+        r["mover_1h_pct"] = r["mover_2h_pct"] = r["mover_night_pct"] = None
+        if src != "b":
+            continue
+        cur = r.get("dec_mv") or r["dec"]
         ref1 = pick_ref(hist, now, 60, MOVER_MIN_AGE_MIN, 150, src)
         ref2, refo = pick_ref(hist, now, src=src), pick_open(hist, now, src=src)
-        r["mover_1h_pct"] = round((r["dec"] - ref1) / ref1 * 100, 1) if ref1 else None
-        r["mover_2h_pct"] = round((r["dec"] - ref2) / ref2 * 100, 1) if ref2 else None
-        r["mover_night_pct"] = round((r["dec"] - refo) / refo * 100, 1) if refo else None
+        if ref1:
+            r["mover_1h_pct"] = round((cur - ref1) / ref1 * 100, 1)
+        if ref2:
+            r["mover_2h_pct"] = round((cur - ref2) / ref2 * 100, 1)
+        if refo:
+            r["mover_night_pct"] = round((cur - refo) / refo * 100, 1)
 
 
 # ----------------------------------------------------------------------------
@@ -1297,7 +1325,7 @@ def load_snapshots(sh, day):
         try:
             snaps[snap_key(v[1], v[2], v[3], v[4])].append(
                 (dt.datetime.fromisoformat(v[0]), float(v[5]), v[6] if len(v) > 6 and v[6] else "p",
-                 to_float(v[7]) if len(v) > 7 else None))
+                 to_float(v[7]) if len(v) > 7 else None, to_float(v[8]) if len(v) > 8 else None))
         except ValueError:
             continue
     if len(vals) > 30000:
@@ -1305,7 +1333,7 @@ def load_snapshots(sh, day):
     return snaps, max(0, len(vals) - 1)
 
 
-SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price", "src", "dec_best"]
+SNAP_HEAD = ["ts", "date", "course", "time", "horse", "dec_price", "src", "dec_best", "dec_mv"]
 
 
 R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob", "model_prob",
@@ -1775,7 +1803,7 @@ def guide_rows():
     R("SIGNALS", "The same runners sorted with the biggest edge at the top, plus shorten_score.", "Quick way to see which horses the model likes most.")
     R("VALUE_BETS_TARGET", "Only runners whose edge is at least the minimum (2% by default), biggest first.", "Horses the model rates clearly above the market.")
     R("RACES_TARGET", "The races found for the day and how many runners had prices.", "A quick check that every meeting was picked up.")
-    R("MARKET_MOVERS_1H", "Horses whose price has moved by 5% or more compared with about an hour ago.", "Late money is often the most informative.")
+    R("MARKET_MOVERS_1H", "Horses whose average bookmaker price has moved by 5% or more compared with about an hour ago. Horses without real bookmaker prices are not listed.", "Late money is often the most informative.")
     R("MARKET_MOVERS_2H", "Horses whose price has moved by 5% or more compared with about two hours ago.", "Same idea over a longer window.")
     R("MARKET_MOVERS", "Horses whose price has moved by 5% or more compared with the first price of the day (the evening before when available).", "Shows overnight and all-day support or doubt.")
     R("MARKET_SNAPSHOTS_LOG", "A price snapshot of every runner each time the program runs.", "Needed to work out the movers. Grows over time.")
@@ -1827,7 +1855,7 @@ def guide_rows():
     R("odds", "The price when the pick was made, as fractions (for example 9/2). It is the best bookmaker price we could find, or the Probable SP if bookmaker prices weren't available.", "The price you would have taken.")
     R("odds_at_pick", "Same as odds, as stored in the tracker.", "")
     R("dec_at_pick", "The price at pick time in decimal form (9/2 is 5.5, evens is 2.0).", "Used for the maths. Decimal price = stake returned per 1 staked including the stake.")
-    R("night_price", "The best bookmaker price from the evening before the race, as fractions.", "Shows how the price moved overnight. Blank if bookmakers hadn't priced the race by the late run.")
+    R("night_price", "The best bookmaker price from the evening before the race, as fractions.", "Shows how the price moved overnight. Blank if no bookmaker price was seen for that horse the evening before (the late run needs the odds page to show a price for it). Check probable_sp_race rows on DASHBOARD.")
     R("night_dec", "The night-before price in decimal form.", "Used to work out night CLV.")
     R("model_prob", "The model's chance that the horse wins, as a percentage. 30% is roughly 2/1.", "Compare with fair_prob. The gap is the edge.")
     R("value_edge", "model_prob minus fair_prob, in percentage points. 5% means the model rates the horse 5 points better than the market does.", "Bigger means the model disagrees with the market more. 5% or more turns the row green.")
@@ -1862,7 +1890,7 @@ def guide_rows():
     R("dec", "The market price in decimal form: the middle (median) bookmaker price, or the Probable SP if bookmaker prices weren't available.", "Used for the market's view.")
     R("fair_prob", "The market's chance for the horse, as a percentage, after removing the bookmakers' margin so all the runners add up to 100%.", "Compare with model_prob.")
     R("ev", "Expected value: model_prob times the best price, minus 1. 5% means the model expects 5 cents profit per euro staked, if it is right.", "Positive means value at the best price available. The model can be wrong, so treat it as a guide.")
-    R("mover_1h_pct", "How far the price has moved in the last hour, as a percentage. Negative means shortened (more support), positive means drifted.", "-20% means the price got a fifth shorter.")
+    R("mover_1h_pct", "How far the average bookmaker price has moved in the last hour, as a percentage. Negative means shortened (more support), positive means drifted. A blank means there was no earlier bookmaker price to compare with (for example the race is on the Probable SP forecast, which never moves). A 0 means it was compared and had not moved.", "-20% means the price got a fifth shorter.")
     R("mover_2h_pct", "The same over about two hours.", "")
     R("mover_night_pct", "The same since the first price of the day (the evening before when available).", "")
     R("shorten_score", "A single number for how much the price has shortened recently (larger means more support).", "Handy for sorting in SIGNALS.")
@@ -1888,6 +1916,7 @@ def guide_rows():
     R("flag", "The race flag at the time of logging (see race_flag).", "")
     R("handicap", "Whether the race is a handicap.", "")
     R("ts", "The time of a price snapshot.", "")
+    R("dec_mv", "The average bookmaker price in decimal form in a snapshot (for the Probable SP it is the forecast itself).", "Used to measure price moves. An average moves a little whenever any bookmaker moves, unlike a middle price which can stay put for hours.")
     R("dec_price", "The market price in decimal form in a snapshot.", "")
     R("ref_move_pct", "In the movers tabs: how far the price has moved against the earlier price, as a percentage.", "")
     R("direction", "In the movers tabs: shortening or drifting.", "")
@@ -2017,7 +2046,7 @@ def main():
     stamp = now.isoformat(timespec="seconds")
     append_rows(sh, "MARKET_SNAPSHOTS_LOG", SNAP_HEAD,
                 [[stamp, r["date"], r["course"], r["time"], r["horse"], r["dec"], r.get("src", "p"),
-                  r.get("dec_best")] for r in runners])
+                  r.get("dec_best") or r.get("book_best_any"), r.get("dec_mv")] for r in runners])
 
     # 4. model + bets
     add_model(runners)
@@ -2153,6 +2182,7 @@ def main():
             ["race_best_settled", sum(1 for r in race_best if r["status"] == "SETTLED")],
             ["race_best_non_runners", sum(1 for r in race_best if r["status"] == "NON-RUNNER")],
             ["place_results_rechecked", rechecked],
+            ["races_on_probable_sp", sum(1 for x in races if x.get("price_src") == "probable SP")],
             ["bets_staking_pnl_eur", round(sum(to_float(r.get("pnl_eur"), 0) for r in tracker
                                                if r["status"] == "SETTLED"), 2)],
             ["race_best_staking_pnl_eur", round(sum(to_float(r.get("pnl_eur"), 0) for r in race_best
@@ -2175,6 +2205,8 @@ def main():
             ["blocked_segments", "; ".join(f"{k} (n={v[0]}, ROI {v[1]}%, CLV {v[2]}%)"
                                            for k, v in blocked.items()) or "none"],
             ["baseline_settled", sum(1 for r in fav_best if r["status"] == "SETTLED")], []]
+    for x in [x for x in races if x.get("price_src") == "probable SP"][:10]:
+        dash.append(["probable_sp_race", f"{x['course']} {x['time']}: bookmaker prices cover {x.get('books_cover', '?')} runners"])
     for course, (nr, nrun) in sorted(per_meeting.items()):
         dash.append([f"meeting: {course}", f"{nr} races, {nrun} priced runners"])
     for w in warnings[:40]:
