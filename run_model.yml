@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: "*/30 6-21 * * *"   # every 30 min during racing hours (UTC)
     - cron: "15 22 * * *"       # late run: settles results, runs the analysis, targets tomorrow
+    - cron: "45 22 * * *"       # second late run: a spare chance to record the night-before prices
   workflow_dispatch: {}
 
 concurrency:
@@ -37,6 +38,11 @@ jobs:
           USE_FITTED_WEIGHTS: ${{ secrets.USE_FITTED_WEIGHTS }}
           LOG_WINDOW_MIN: ${{ secrets.LOG_WINDOW_MIN }}
           MAX_FIELD_HCAP: ${{ secrets.MAX_FIELD_HCAP }}
+          WIN_FOCUS: ${{ secrets.WIN_FOCUS }}
+          MIN_WIN_PROB: ${{ secrets.MIN_WIN_PROB }}
+          MAX_WIN_DEC: ${{ secrets.MAX_WIN_DEC }}
+          MAX_FIELD: ${{ secrets.MAX_FIELD }}
+          BEST_RULE: ${{ secrets.BEST_RULE }}
           DEBUG_DUMP: "1"
         run: python horse_model.py
 
