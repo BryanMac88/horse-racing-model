@@ -42,6 +42,7 @@ jobs:
           MIN_WIN_PROB: ${{ secrets.MIN_WIN_PROB }}
           MAX_WIN_DEC: ${{ secrets.MAX_WIN_DEC }}
           MAX_FIELD: ${{ secrets.MAX_FIELD }}
+          BOOKMAKERS: ${{ secrets.BOOKMAKERS }}
           BEST_RULE: ${{ secrets.BEST_RULE }}
           DEBUG_DUMP: "1"
         run: python horse_model.py
