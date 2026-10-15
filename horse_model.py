@@ -32,6 +32,8 @@ Environment variables
   MAX_WIN_DEC     win-focus: maximum decimal price, default 5.0 (4/1)
   MAX_FIELD       win-focus: skip races with more declared runners than this, default 12
   BEST_RULE       prob (default) = BEST_PER_RACE picks the horse most likely to win; edge = biggest value edge
+  BOOKMAKERS      the bookmakers you bet with, default "PaddyPower,Boylesports". Your price (and the night-before
+                  price) is the best of THESE only. Use "all" for the best of every bookmaker on the page.
 
 Staking used for the euro P&L and ROI columns (how the bets are actually placed):
   price under 9/2  -> 5 euro win
@@ -78,6 +80,19 @@ STAKE_WIN = 5.0                    # euro on a straight win bet
 STAKE_EW = 2.5                     # euro each way (win part and place part)
 EW_FROM = 5.5                      # decimal price at which win bets become each way (9/2)
 EW_PLACE_FRACTION = 0.2            # each-way place part pays 1/5 of the odds
+def parse_bookmakers(text):
+    """'PaddyPower, Boylesports' -> {'paddypower', 'boylesports'}; 'all' -> None (every bookmaker)."""
+    t = (text or "").strip()
+    if not t:
+        t = "PaddyPower,Boylesports"
+    if t.lower() in ("all", "*", "any"):
+        return None
+    return {re.sub(r"[^a-z0-9]", "", x.lower()) for x in t.split(",") if x.strip()}
+
+
+_BOOK_TEXT = (os.environ.get("BOOKMAKERS") or "").strip() or "PaddyPower,Boylesports"
+PREFERRED_BOOKS = parse_bookmakers(_BOOK_TEXT)                                    # None = every bookmaker
+BOOK_LABEL = "all bookmakers" if PREFERRED_BOOKS is None else " + ".join(x.strip() for x in _BOOK_TEXT.split(",") if x.strip())
 PLACE_RULES_V = "2"                # bumped when place settlement changed; older rows are re-checked
 AUTO_FILTER = (os.environ.get("AUTO_FILTER") or "1") != "0"
 USE_FITTED = (os.environ.get("USE_FITTED_WEIGHTS") or "0") == "1"
@@ -415,9 +430,11 @@ def parse_course_form(lines):
     return out
 
 
-def parse_odds_compare(html, known=()):
-    """Odds Compare page -> {norm(horse): {"best": dec, "median": dec, "books": n}}.
-    Uses the bookmaker columns only (tote and any wild outlier prices are dropped)."""
+def parse_odds_compare(html, known=(), only=None):
+    """Odds Compare page -> {norm(horse): {...}} using the bookmaker columns (tote and wild outliers dropped).
+    market price: "median", "mean", "best" and "books" come from EVERY bookmaker (a steady view of the market).
+    your price: "price_taken" / "taken_book" are the best price from the bookmakers named in `only`
+    (a set of lowercase names without spaces, e.g. {"paddypower", "boylesports"}); None means every bookmaker."""
     soup = BeautifulSoup(html, "html.parser")
     out = {}
     for table in soup.find_all("table"):
@@ -427,7 +444,7 @@ def parse_odds_compare(html, known=()):
             if not cells:
                 continue
             if header is None and any(c.lower() == "bet365" for c in cells):
-                header = [c.lower() for c in cells]
+                header = cells
             else:
                 rows.append(cells)
         if header is None:
@@ -440,20 +457,28 @@ def parse_odds_compare(html, known=()):
                           and not PRICE_ONLY_RE.match(c)), None)
             if j is None:
                 continue
-            decs = []
+            pairs = []                                   # (bookmaker, decimal price)
             for i in range(j + 2, len(cells)):          # j+1 is the opening/summary cell
-                if i < len(header) and header[i] in ("tote", ""):
+                hname = header[i] if i < len(header) else ""
+                if hname.lower() in ("tote", ""):
                     continue
                 if PRICE_ONLY_RE.match(cells[i]):
-                    decs.append(parse_odds(cells[i])[1])
-            decs = sorted(d for d in decs if d)
+                    d = parse_odds(cells[i])[1]
+                    if d:
+                        pairs.append((hname, d))
+            decs = sorted(d for _, d in pairs)
             if len(decs) >= 4:
                 med = decs[len(decs) // 2]
-                decs = [d for d in decs if med / 1.6 <= d <= med * 1.6]
+                pairs = [(b, d) for b, d in pairs if med / 1.6 <= d <= med * 1.6]
+                decs = sorted(d for _, d in pairs)
             if len(decs) >= 3:
                 med = decs[len(decs) // 2]
-                out[norm(display_name(cells[j]))] = {"best": max(decs), "median": med, "books": len(decs),
-                                                     "mean": sum(decs) / len(decs)}
+                mine = [(b, d) for b, d in pairs
+                        if only is None or re.sub(r"[^a-z0-9]", "", b.lower()) in only]
+                taken = max(mine, key=lambda x: x[1]) if mine else (None, None)
+                out[norm(display_name(cells[j]))] = {
+                    "best": max(decs), "median": med, "books": len(decs), "mean": sum(decs) / len(decs),
+                    "price_taken": taken[1], "taken_book": taken[0]}
     return out
 
 
@@ -605,7 +630,7 @@ def scrape_day(day, now, warnings):
         books_all = {}
         ohtml = get(url.replace("/racecards/", "/odds-comparison/"))
         if ohtml:
-            books_all = parse_odds_compare(ohtml, {e["norm"] for e in entries})
+            books_all = parse_odds_compare(ohtml, {e["norm"] for e in entries}, PREFERRED_BOOKS)
         covered = sum(1 for e in entries if e["norm"] in books_all)
         # bookmaker prices run the race when they cover most of the field (the rest keep the Probable SP);
         # with thin coverage the whole race stays on the Probable SP, but the prices we did see are still
@@ -616,10 +641,11 @@ def scrape_day(day, now, warnings):
             ba = books_all.get(e["norm"])
             e["dec_sp"] = e["dec"]
             e["dec_best"], e["books"], e["src"], e["dec_mv"] = None, 0, "p", e["dec"]
-            e["book_best_any"] = ba["best"] if ba else None
+            e["book_best_any"] = ba["price_taken"] if ba else None        # remembered for the night-before record
+            e["best_book"] = ""
             if b:
-                e["dec"], e["dec_best"], e["books"], e["src"], e["dec_mv"] = (
-                    b["median"], b["best"], b["books"], "b", b["mean"])
+                e["dec"], e["books"], e["src"], e["dec_mv"] = b["median"], b["books"], "b", b["mean"]
+                e["dec_best"], e["best_book"] = b["price_taken"], b["taken_book"] or ""    # YOUR bookmakers' best price
                 e["odds"] = frac_text(b["median"])
         priced = [e for e in entries if e["dec"]]
         per_meeting[course][0] += 1
@@ -655,7 +681,7 @@ def scrape_day(day, now, warnings):
                             "wwr_gap": e["wwr_gap"], "course_wins": e["course_wins"],
                             "course_runs": e["course_runs"], "bf": e["bf"],
                             "weight_lb": e["weight_lb"], "dec_mv": e["dec_mv"],
-                            "book_best_any": e["book_best_any"]})
+                            "book_best_any": e["book_best_any"], "best_book": e["best_book"]})
     return races, runners, per_meeting, info
 
 
@@ -927,7 +953,8 @@ def pick_fields(b, rule=""):
             "form_score": round(fs, 2) if fs is not None else "",
             "confidence": b.get("confidence", ""), "reason": b.get("reason", ""),
             "race_flag": b.get("flag", ""),
-            "price_src": f"best of {b.get('books')} books" if best else "probable SP",
+            "price_src": (f"{b.get('best_book') or 'best'} (best of {BOOK_LABEL})" if best else
+                          "market price (no price from your bookmakers)" if b.get("src") == "b" else "probable SP"),
             "declared": b.get("declared", ""), "night_dec": b.get("night_best") or "",
             "pick_rule": rule}
 
@@ -1340,7 +1367,7 @@ R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob
           "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
           "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason",
           "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs",
-          "night_price"]
+          "night_price", "best_book"]
 BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "night_price", "model_prob",
              "value_edge", "form_score", "confidence", "reason", "race_flag", "status", "position",
              "field_size", "places_paid", "sp", "clv_pct", "night_clv_pct", "won", "placed",
@@ -1772,6 +1799,9 @@ def guide_rows():
     R("Your staking",
       "Price under 9/2: 5 euro to win. Price 9/2 or bigger: 2.50 euro each way (2.50 win + 2.50 place = 5 euro in total), with the place part paid at 1/5 of the odds. Every euro column in the sheet uses these rules.",
       "This is how you really bet, so the euro columns are the most realistic measure of results.")
+    R("Which bookmakers",
+      "Your price, and the night-before price, are the best price from YOUR bookmakers only: Paddy Power and Boylesports by default (change them with the BOOKMAKERS setting). The overall market view (the middle price, fair_prob and the price moves) still uses every bookmaker on the page, because that is a steadier picture of the market.",
+      "So the euro results show what you could really have taken. best_book tells you which of your bookmakers has the best price.")
     R("Green rows",
       "Any row with a value_edge of 5% or more is shaded green.",
       "Green means the model rates that horse at least 5 percentage points better than the market does. These are the strongest opinions.")
@@ -1852,10 +1882,10 @@ def guide_rows():
     R("time", "The off time as four digits, for example 1530 is 3:30pm.", "")
     R("region", "gb for Britain or ire for Ireland.", "")
     R("horse", "The horse picked.", "")
-    R("odds", "The price when the pick was made, as fractions (for example 9/2). It is the best bookmaker price we could find, or the Probable SP if bookmaker prices weren't available.", "The price you would have taken.")
+    R("odds", "The price when the pick was made, as fractions (for example 9/2). It is the best price from your bookmakers (Paddy Power and Boylesports by default). If they had no price it is the middle price of all bookmakers, and if there were no bookmaker prices at all it is the Probable SP.", "The price you would have taken. price_src says which one it was.")
     R("odds_at_pick", "Same as odds, as stored in the tracker.", "")
     R("dec_at_pick", "The price at pick time in decimal form (9/2 is 5.5, evens is 2.0).", "Used for the maths. Decimal price = stake returned per 1 staked including the stake.")
-    R("night_price", "The best bookmaker price from the evening before the race, as fractions.", "Shows how the price moved overnight. Blank if no bookmaker price was seen for that horse the evening before (the late run needs the odds page to show a price for it). Check probable_sp_race rows on DASHBOARD.")
+    R("night_price", "The best price from your bookmakers (Paddy Power and Boylesports by default) from the evening before the race, as fractions.", "Shows how the price moved overnight. Blank if no bookmaker price was seen for that horse the evening before (the late run needs the odds page to show a price for it). Check probable_sp_race rows on DASHBOARD.")
     R("night_dec", "The night-before price in decimal form.", "Used to work out night CLV.")
     R("model_prob", "The model's chance that the horse wins, as a percentage. 30% is roughly 2/1.", "Compare with fair_prob. The gap is the edge.")
     R("value_edge", "model_prob minus fair_prob, in percentage points. 5% means the model rates the horse 5 points better than the market does.", "Bigger means the model disagrees with the market more. 5% or more turns the row green.")
@@ -1880,7 +1910,7 @@ def guide_rows():
     R("pnl_eur", "Euro profit or loss at the price you could take when the pick was made. Each-way bets pay the win part at full odds and the place part at 1/5 of the odds.", "Your realistic result for the bet.")
     R("pnl_eur_sp", "Euro profit or loss if the same bet had been placed at the starting price.", "Shows how much depends on getting the earlier price.")
     R("pick_rule", "The method that chose the pick: prob, edge, win-focus or fav. Blank on very old rows means edge.", "Lets you compare methods.")
-    R("price_src", "Where the pick price came from, for example 'best of 12 books' or 'probable SP'.", "Bookmaker prices are the real ones. Probable SP is only an estimate.")
+    R("price_src", "Where the pick price came from, for example 'PaddyPower (best of PaddyPower + Boylesports)', 'market price (no price from your bookmakers)' or 'probable SP'.", "The first kind is a price you could really have taken. The other two are only guides.")
     R("declared", "How many runners were declared when the pick was made.", "Used to avoid counting too many runners when working out places.")
     R("nr_note", "For a non-runner: a note saying the horse wasn't on the result page, and which name there was closest.", "Check it if you think a horse did run. A near match means a spelling problem, not a non-runner.")
     R("rules_v", "An internal version number for how places were worked out.", "Ignore. It lets the program re-check older results once.")
@@ -1898,7 +1928,8 @@ def guide_rows():
     R("days_off", "Days since the horse last ran.", "Over 90 days off counts against a horse.")
     R("trainer_rate", "The trainer's win rate over the last 21 days, smoothed so small samples don't mislead.", "A hot trainer is a small positive.")
     R("jockey_rate", "The jockey's win rate over the last 21 days, smoothed in the same way.", "")
-    R("best_price", "The biggest price any bookmaker is offering for the horse.", "Where to bet.")
+    R("best_price", "The biggest price your bookmakers (Paddy Power and Boylesports by default) are offering for the horse. Blank if neither has a price.", "The price to take.")
+    R("best_book", "Which of your bookmakers has that best price.", "Where to place the bet.")
     R("books", "How many bookmakers' prices the market price was based on.", "More bookmakers means a more reliable price.")
     R("wwr_gap", "The horse's best winning mark minus today's rating, in 10lb units. Positive means it is rated below the mark it has won off.", "Positive is a small plus.")
     R("course_wins", "How many times the horse has won at this course.", "")
@@ -1959,6 +1990,7 @@ def guide_rows():
 
     H("11. SETTINGS YOU CAN CHANGE (GitHub: Settings > Secrets and variables > Actions)")
     R("REGION", "all, gb or ire. Which countries to include.", "")
+    R("BOOKMAKERS", "The bookmakers you bet with, separated by commas, for example PaddyPower,Boylesports (the default). Write all to use the best price from every bookmaker instead.", "Your price and the night-before price use only these.")
     R("WIN_FOCUS", "1 (the default) makes BETS_TO_PLACE back only the model's top-rated horse. 0 uses the older biggest-value-edge method.", "")
     R("MAX_WIN_DEC", "The biggest decimal price allowed for BETS_TO_PLACE. 5.0 is 4/1.", "Lower means shorter prices and more winners.")
     R("MAX_FIELD", "The most runners allowed in a BETS_TO_PLACE race. 12 by default.", "")
@@ -2089,7 +2121,7 @@ def main():
                 r.get("confidence"), r.get("flag"), r.get("reason"),
                 frac_text(r.get("dec_best")), r.get("books"), r.get("mover_1h_pct"),
                 r.get("wwr_gap"), r.get("course_wins"), r.get("course_runs"),
-                frac_text(r.get("night_best"))]
+                frac_text(r.get("night_best")), r.get("best_book")]
 
     if runners:
         write_tab(sh, "RUNNERS_TARGET", r_head, [rr(r) for r in runners])
