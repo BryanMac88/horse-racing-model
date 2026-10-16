@@ -13,6 +13,8 @@ What it does each run
   6. Rewrites the summary tabs, including TRACKER_SUMMARY (win % / place % / ROI).
   7. Compares each race's field with the first field seen (FIELD_BASELINE) and highlights
      horses ADDED (yellow) or REMOVED (red, struck through).
+  8. Adjusts the night-before price and the price moves for withdrawn horses (Rule 4 style),
+     so a horse shortening only because another one was removed is not counted as a move.
 
 Environment variables
   GOOGLE_CREDS    full service-account JSON (or put credentials.json next to this file)
@@ -717,8 +719,9 @@ def _val(h, src):
     return h[1]
 
 
-def pick_ref(hist, now, target_min=120, lo=MOVER_MIN_AGE_MIN, hi=300, src=None):
-    """Price from the snapshot closest to `target_min` minutes ago, within [lo, hi] minutes old."""
+def pick_ref(hist, now, target_min=120, lo=MOVER_MIN_AGE_MIN, hi=300, src=None, with_ts=False):
+    """Price from the snapshot closest to `target_min` minutes ago, within [lo, hi] minutes old.
+    With with_ts=True returns (snapshot time, price) instead of just the price."""
     best = None
     for h in hist:
         v = _val(h, src)
@@ -728,15 +731,20 @@ def pick_ref(hist, now, target_min=120, lo=MOVER_MIN_AGE_MIN, hi=300, src=None):
         if lo <= age <= hi:
             d = abs(age - target_min)
             if best is None or d < best[0]:
-                best = (d, v)
-    return best[1] if best else None
+                best = (d, v, h[0])
+    if not best:
+        return None
+    return (best[2], best[1]) if with_ts else best[1]
 
 
-def pick_open(hist, now, lo=MOVER_MIN_AGE_MIN, src=None):
+def pick_open(hist, now, lo=MOVER_MIN_AGE_MIN, src=None, with_ts=False):
     """Price from the earliest snapshot of the day that is at least `lo` minutes old."""
     old = [(h[0], _val(h, src)) for h in hist
            if _val(h, src) is not None and (now - h[0]).total_seconds() / 60 >= lo]
-    return min(old)[1] if old else None
+    if not old:
+        return None
+    first = min(old)
+    return first if with_ts else first[1]
 
 
 def pick_night_best(hist, race_day):
@@ -745,19 +753,74 @@ def pick_night_best(hist, race_day):
     return max(cand, key=lambda h: h[0])[3] if cand else None
 
 
-def add_movers(runners, snaps, now):
+def pick_night_snap(hist, race_day):
+    """The last snapshot taken the evening before the race that has a bookmaker price, else None."""
+    cand = [h for h in hist if len(h) > 3 and h[3] and h[0].date() < race_day]
+    return max(cand, key=lambda h: h[0]) if cand else None
+
+
+def nr_adjustments(removed, snaps):
+    """{race_key: [(last_seen_ts, fair_prob, name)]} for each removed horse that has price history today.
+    fair_prob is the horse's share of the market (margin removed) at the last run where it still had a price."""
+    out = {}
+    for rk, items in removed.items():
+        prefix = rk + "|"
+        by_ts = defaultdict(float)
+        for key, hist in snaps.items():
+            if key.startswith(prefix):
+                for h in hist:
+                    if h[1]:
+                        by_ts[h[0]] += 1.0 / h[1]
+        for name, n in items:
+            hist = snaps.get(prefix + n)
+            if not hist:
+                continue
+            last = max(hist, key=lambda h: h[0])
+            total = by_ts.get(last[0], 0.0)
+            if not last[1] or total <= 0:
+                continue
+            out.setdefault(rk, []).append((last[0], (1.0 / last[1]) / total, name))
+    return out
+
+
+def deduction_since(nr, rk, ts):
+    """Rule 4 style deduction (a fraction, capped at 0.9) for horses withdrawn after the snapshot at `ts`.
+    A horse counts if it still had a price in that snapshot or later."""
+    return min(0.9, sum(p for last, p, _ in nr.get(rk, []) if last >= ts))
+
+
+def rule4_price(dec, ded):
+    """Decimal price after a deduction: the winnings part is cut by `ded` (0.2 = 20p in the pound)."""
+    if not dec or not ded:
+        return dec
+    return 1 + (dec - 1) * (1 - ded)
+
+
+def add_movers(runners, snaps, now, nr=None):
     """Price moves in %, negative = shortened. Only real bookmaker prices are compared (a Probable SP
-    forecast does not move, so those horses get blanks, not a misleading 0)."""
+    forecast does not move, so those horses get blanks, not a misleading 0). When a horse has been
+    withdrawn since a reference price was taken, that reference price is first cut Rule 4 style, so the
+    other runners shortening only because of the withdrawal is not counted as a move."""
+    nr = nr or {}
     for r in runners:
         hist = snaps.get(snap_key(r["date"], r["course"], r["time"], r["horse"]), [])
-        r["night_best"] = pick_night_best(hist, dt.date.fromisoformat(r["date"]))
+        rk = f"{r['date']}|{norm(r['course'])}|{r['time']}"
+        nsnap = pick_night_snap(hist, dt.date.fromisoformat(r["date"]))
+        ded_n = deduction_since(nr, rk, nsnap[0]) if nsnap else 0.0
+        r["night_best"] = rule4_price(nsnap[3], ded_n) if nsnap else None
+        r["nr_deduction"] = round(ded_n, 4) if ded_n else ""
         src = r.get("src", "p")
         r["mover_1h_pct"] = r["mover_2h_pct"] = r["mover_night_pct"] = None
         if src != "b":
             continue
         cur = r.get("dec_mv") or r["dec"]
-        ref1 = pick_ref(hist, now, 60, MOVER_MIN_AGE_MIN, 150, src)
-        ref2, refo = pick_ref(hist, now, src=src), pick_open(hist, now, src=src)
+
+        def adj(t):
+            return rule4_price(t[1], deduction_since(nr, rk, t[0])) if t else None
+
+        ref1 = adj(pick_ref(hist, now, 60, MOVER_MIN_AGE_MIN, 150, src, with_ts=True))
+        ref2 = adj(pick_ref(hist, now, src=src, with_ts=True))
+        refo = adj(pick_open(hist, now, src=src, with_ts=True))
         if ref1:
             r["mover_1h_pct"] = round((cur - ref1) / ref1 * 100, 1)
         if ref2:
@@ -1380,7 +1443,7 @@ R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob
           "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
           "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason",
           "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs",
-          "night_price", "best_book", "field_change"]
+          "night_price", "best_book", "field_change", "nr_deduction"]
 BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "night_price", "model_prob",
              "value_edge", "form_score", "confidence", "reason", "race_flag", "status", "position",
              "field_size", "places_paid", "sp", "clv_pct", "night_clv_pct", "won", "placed",
@@ -1389,7 +1452,8 @@ BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "night_price",
 
 HIGHLIGHT_EDGE = 0.05                     # rows with an edge of 5% or more are highlighted green
 HIGHLIGHT_RGB = {"red": 0.78, "green": 0.94, "blue": 0.81}
-RUNNER_PCT = ["fair_prob", "model_prob", "value_edge", "ev", "trainer_rate", "jockey_rate", "confidence"]
+RUNNER_PCT = ["fair_prob", "model_prob", "value_edge", "ev", "trainer_rate", "jockey_rate", "confidence",
+              "nr_deduction"]
 # tab -> (header, column holding the edge (or (model, market) columns), columns shown as %)
 # The trackers are read back by this script, so they are highlighted but their numbers are left as they are.
 def format_specs():
@@ -1834,6 +1898,9 @@ def guide_rows():
     R("Yellow and red rows (field changes)",
       "The first time the program sees a race it remembers the field. If a horse appears later that was not in that first field, the row turns yellow and says ADDED. If a horse from the first field has gone, a red row with a line through it says REMOVED.",
       "Late additions and removals change the race. Re-check your pick if a horse in its race was added or removed.")
+    R("Withdrawn horses and prices",
+      "When a horse is withdrawn, the other horses' prices shorten automatically (the bookmakers re-balance the market). So the program cuts the earlier price (the night-before price and the earlier prices used for the 1h, 2h and overnight moves) by the withdrawn horse's share of the market, in the same way as a Rule 4 deduction, before comparing. This is an approximation, not the official Rule 4 table.",
+      "Without this, a horse would look like it was being backed just because another horse was taken out. nr_deduction shows how much was taken off.")
     R("Picks can change until the off",
       "While a race is still to run, its pick can change as prices and information change. Once the race is off, the pick is locked, and that locked pick is the one that is judged.",
       "So a pick you saw early in the day may differ from the final one. Look at the latest run before betting.")
@@ -1915,7 +1982,7 @@ def guide_rows():
     R("odds", "The price when the pick was made, as fractions (for example 9/2). It is the best price from your bookmakers (Paddy Power and Boylesports by default). If they had no price it is the middle price of all bookmakers, and if there were no bookmaker prices at all it is the Probable SP.", "The price you would have taken. price_src says which one it was.")
     R("odds_at_pick", "Same as odds, as stored in the tracker.", "")
     R("dec_at_pick", "The price at pick time in decimal form (9/2 is 5.5, evens is 2.0).", "Used for the maths. Decimal price = stake returned per 1 staked including the stake.")
-    R("night_price", "The best price from your bookmakers (Paddy Power and Boylesports by default) from the evening before the race, as fractions.", "Shows how the price moved overnight. Blank if no bookmaker price was seen for that horse the evening before (the late run needs the odds page to show a price for it). Check probable_sp_race rows on DASHBOARD.")
+    R("night_price", "The best price from your bookmakers (Paddy Power and Boylesports by default) from the evening before the race, as fractions.", "Shows how the price moved overnight (cut for any horses withdrawn since, see nr_deduction). Blank if no bookmaker price was seen for that horse the evening before (the late run needs the odds page to show a price for it). Check probable_sp_race rows on DASHBOARD.")
     R("night_dec", "The night-before price in decimal form.", "Used to work out night CLV.")
     R("model_prob", "The model's chance that the horse wins, as a percentage. 30% is roughly 2/1.", "Compare with fair_prob. The gap is the edge.")
     R("value_edge", "model_prob minus fair_prob, in percentage points. 5% means the model rates the horse 5 points better than the market does.", "Bigger means the model disagrees with the market more. 5% or more turns the row green.")
@@ -1955,6 +2022,7 @@ def guide_rows():
     R("mover_2h_pct", "The same over about two hours.", "")
     R("mover_night_pct", "The same since the first price of the day (the evening before when available).", "")
     R("shorten_score", "A single number for how much the price has shortened recently (larger means more support).", "Handy for sorting in SIGNALS.")
+    R("nr_deduction", "How much was taken off the earlier prices because of withdrawn horses, as a percentage (20% means the winnings part of the night-before price was cut by a fifth). Blank means no withdrawal affected this horse.", "Already applied to night_price and the mover columns. It is the combined market share of the withdrawn horses, capped at 90%.")
     R("rating", "The horse's official rating (higher means better).", "The model compares it with the rest of the field.")
     R("days_off", "Days since the horse last ran.", "Over 90 days off counts against a horse.")
     R("trainer_rate", "The trainer's win rate over the last 21 days, smoothed so small samples don't mislead.", "A hot trainer is a small positive.")
@@ -2162,19 +2230,20 @@ def main():
 
     # 3. snapshots + movers
     snaps, snap_rows = load_snapshots(sh, day)
-    added, removed, removed_rows = {}, {}, []
+    added, removed, removed_rows, nr_adj = {}, {}, [], {}
     try:
         base = load_baseline(sh, now.date())
         added, removed, new_base = field_changes(FIELDS, base, now)
         append_rows(sh, "FIELD_BASELINE", BASE_HEAD, new_base)
         removed_rows = [removed_runner(FIELDS[rk]["date"], FIELDS[rk]["course"], FIELDS[rk]["time"], name)
                         for rk, items in removed.items() for name, _ in items]
+        nr_adj = nr_adjustments(removed, snaps)
     except Exception as ex:                     # never let this break the main job
         warnings.append(f"field change step failed: {ex}")
     for r in runners:
         rk = f"{r['date']}|{norm(r['course'])}|{r['time']}"
         r["field_change"] = "ADDED" if r["norm"] in added.get(rk, ()) else ""
-    add_movers(runners, snaps, now)
+    add_movers(runners, snaps, now, nr_adj)
     stamp = now.isoformat(timespec="seconds")
     append_rows(sh, "MARKET_SNAPSHOTS_LOG", SNAP_HEAD,
                 [[stamp, r["date"], r["course"], r["time"], r["horse"], r["dec"], r.get("src", "p"),
@@ -2203,6 +2272,11 @@ def main():
                         "course": b["course"], "time": b["time"], "status": "PENDING",
                         **pick_fields(b, "win-focus" if WIN_FOCUS else "edge")})
         new_bets += 1
+    cur_by_key = {runner_key(r): r for r in runners}        # keep pending bets' night price up to date
+    for t in tracker:
+        cr = cur_by_key.get(t["key"]) if t.get("status") == "PENDING" else None
+        if cr and cr.get("night_best"):
+            t["night_dec"] = cr["night_best"]
     save_tracker(sh, tracker)
 
     picks = choose_best_per_race(runners)
@@ -2230,7 +2304,8 @@ def main():
                 r.get("confidence"), r.get("flag"), r.get("reason"),
                 frac_text(r.get("dec_best")), r.get("books"), r.get("mover_1h_pct"),
                 r.get("wwr_gap"), r.get("course_wins"), r.get("course_runs"),
-                frac_text(r.get("night_best")), r.get("best_book"), r.get("field_change", "")]
+                frac_text(r.get("night_best")), r.get("best_book"), r.get("field_change", ""),
+                r.get("nr_deduction", "")]
 
     if runners:
         def _k(r):
@@ -2329,6 +2404,7 @@ def main():
             ["night_book_rows_logged", len(BOOK_ONLY)],
             ["fields_added", sum(len(v) for v in added.values())],
             ["fields_removed", sum(len(v) for v in removed.values())],
+            ["night_prices_nr_adjusted", sum(1 for r in runners if r.get("nr_deduction"))],
             ["races_on_probable_sp", sum(1 for x in races if x.get("price_src") == "probable SP")],
             ["bets_staking_pnl_eur", round(sum(to_float(r.get("pnl_eur"), 0) for r in tracker
                                                if r["status"] == "SETTLED"), 2)],
