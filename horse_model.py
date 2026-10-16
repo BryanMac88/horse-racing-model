@@ -11,6 +11,8 @@ What it does each run
   5. Picks the single best selection in EVERY race (BEST_PER_RACE), re-picking until the off,
      then tracks and settles those too (RACE_BEST_TRACKER / RACE_BEST_SUMMARY).
   6. Rewrites the summary tabs, including TRACKER_SUMMARY (win % / place % / ROI).
+  7. Compares each race's field with the first field seen (FIELD_BASELINE) and highlights
+     horses ADDED (yellow) or REMOVED (red, struck through).
 
 Environment variables
   GOOGLE_CREDS    full service-account JSON (or put credentials.json next to this file)
@@ -101,6 +103,9 @@ MIN_SEG_N = 40                     # settled bets needed before a segment can be
 MIN_FIT_RACES = 300                # logged, settled races needed before fitting weights
 LOG_WINDOW_MIN = int(os.environ.get("LOG_WINDOW_MIN") or 35)   # log a race's inputs once this close to the off
 DEBUG = os.environ.get("DEBUG_DUMP") == "1"
+
+FIELDS = {}      # race key -> field seen on this run (filled by scrape_day)
+BOOK_ONLY = []   # snapshot rows for horses with a bookmaker price but no priced runner row
 
 MIN_DEC, MAX_DEC = 1.8, 13.0       # price window for selections (decimal odds)
 # Starting weights for the form model (logit units). Guesses, to be tuned from the tracker.
@@ -627,6 +632,9 @@ def scrape_day(day, now, warnings):
             continue
         entries, rinfo = parse_racecard(html, day)
         entries = [e for e in entries if not e["nr"]]
+        FIELDS[f"{day.isoformat()}|{norm(course)}|{hhmm}"] = {
+            "date": day.isoformat(), "course": course, "time": hhmm,
+            "horses": [(e["name"], e["norm"]) for e in entries]}
         books_all = {}
         ohtml = get(url.replace("/racecards/", "/odds-comparison/"))
         if ohtml:
@@ -648,6 +656,11 @@ def scrape_day(day, now, warnings):
                 e["dec_best"], e["best_book"] = b["price_taken"], b["taken_book"] or ""    # YOUR bookmakers' best price
                 e["odds"] = frac_text(b["median"])
         priced = [e for e in entries if e["dec"]]
+        for e in entries:
+            ba = books_all.get(e["norm"])
+            if ba and ba.get("price_taken") and (len(priced) < 2 or not e["dec"]):
+                BOOK_ONLY.append([day.isoformat(), course, hhmm, e["name"], ba["median"], "n",
+                                  ba["price_taken"], ba["mean"]])
         per_meeting[course][0] += 1
         per_meeting[course][1] += len(priced)
         declared = rinfo["declared"] or len(entries)
@@ -956,7 +969,7 @@ def pick_fields(b, rule=""):
             "price_src": (f"{b.get('best_book') or 'best'} (best of {BOOK_LABEL})" if best else
                           "market price (no price from your bookmakers)" if b.get("src") == "b" else "probable SP"),
             "declared": b.get("declared", ""), "night_dec": b.get("night_best") or "",
-            "pick_rule": rule}
+            "pick_rule": rule, "field_change": b.get("field_change", "")}
 
 
 def upsert_race_bests(rows, picks, rule=""):
@@ -989,7 +1002,7 @@ TRACKER_COLS = ["key", "date", "course", "time", "region", "horse", "odds_at_pic
                 "pnl_win_units", "pnl_place_units", "settled_at",
                 "form_score", "confidence", "reason", "race_flag", "clv_pct", "price_src",
                 "declared", "rules_v", "night_dec", "night_clv_pct", "pick_rule", "nr_note",
-                "bet_type", "stake_eur", "pnl_eur", "pnl_eur_sp"]
+                "bet_type", "stake_eur", "pnl_eur", "pnl_eur_sp", "field_change"]
 
 
 def staking(dec, won, placed, field):
@@ -1367,12 +1380,12 @@ R_HEAD = ["date", "course", "region", "time", "horse", "odds", "dec", "fair_prob
           "value_edge", "ev", "mover_2h_pct", "mover_night_pct", "form_score", "rating",
           "days_off", "trainer_rate", "jockey_rate", "confidence", "race_flag", "reason",
           "best_price", "books", "mover_1h_pct", "wwr_gap", "course_wins", "course_runs",
-          "night_price", "best_book"]
+          "night_price", "best_book", "field_change"]
 BEST_HEAD = ["date", "time", "course", "region", "horse", "odds", "night_price", "model_prob",
              "value_edge", "form_score", "confidence", "reason", "race_flag", "status", "position",
              "field_size", "places_paid", "sp", "clv_pct", "night_clv_pct", "won", "placed",
              "pnl_win_units", "pnl_place_units", "bet_type", "stake_eur", "pnl_eur", "pnl_eur_sp",
-             "pick_rule"]
+             "pick_rule", "field_change"]
 
 HIGHLIGHT_EDGE = 0.05                     # rows with an edge of 5% or more are highlighted green
 HIGHLIGHT_RGB = {"red": 0.78, "green": 0.94, "blue": 0.81}
@@ -1414,7 +1427,8 @@ def edge_formula(head, edge):
 
 
 def formatting_requests(meta_sheets, specs=None):
-    """Batch-update requests that (a) highlight rows with edge >= 5% and (b) show rate columns as %.
+    """Batch-update requests that (a) highlight rows with edge >= 5% and (b) show rate columns as %,
+    (c) colour ADDED horses yellow and REMOVED horses red with a strike-through.
     Safe to run every time: an existing identical rule is left alone and stale ones are replaced."""
     specs = format_specs() if specs is None else specs
     dele, add = [], []
@@ -1443,6 +1457,18 @@ def formatting_requests(meta_sheets, specs=None):
                     "booleanRule": {"condition": {"type": "CUSTOM_FORMULA",
                                                   "values": [{"userEnteredValue": want}]},
                                     "format": {"backgroundColor": HIGHLIGHT_RGB}}}}})
+        if "field_change" in head:
+            fc = col_letter(head.index("field_change"))
+            have_f = {(((cf.get("booleanRule") or {}).get("condition") or {}).get("values") or [{}])[0]
+                      .get("userEnteredValue", "") for cf in existing}
+            for formula, fmt in ((f'=${fc}2="ADDED"', ADDED_FMT), (f'=${fc}2="REMOVED"', REMOVED_FMT)):
+                if formula not in have_f:
+                    add.append({"addConditionalFormatRule": {"index": 0, "rule": {
+                        "ranges": [{"sheetId": sid, "startRowIndex": 1, "startColumnIndex": 0,
+                                    "endColumnIndex": len(head)}],
+                        "booleanRule": {"condition": {"type": "CUSTOM_FORMULA",
+                                                      "values": [{"userEnteredValue": formula}]},
+                                        "format": fmt}}}})
         for name in pct_cols:
             c = head.index(name)
             add.append({"repeatCell": {
@@ -1805,6 +1831,9 @@ def guide_rows():
     R("Green rows",
       "Any row with a value_edge of 5% or more is shaded green.",
       "Green means the model rates that horse at least 5 percentage points better than the market does. These are the strongest opinions.")
+    R("Yellow and red rows (field changes)",
+      "The first time the program sees a race it remembers the field. If a horse appears later that was not in that first field, the row turns yellow and says ADDED. If a horse from the first field has gone, a red row with a line through it says REMOVED.",
+      "Late additions and removals change the race. Re-check your pick if a horse in its race was added or removed.")
     R("Picks can change until the off",
       "While a race is still to run, its pick can change as prices and information change. Once the race is off, the pick is locked, and that locked pick is the one that is judged.",
       "So a pick you saw early in the day may differ from the final one. Look at the latest run before betting.")
@@ -1819,8 +1848,8 @@ def guide_rows():
       "Only bet what you can afford to lose.")
 
     H("2. THE TABS YOU SEE")
-    R("BEST_PER_RACE", "Yesterday's and today's pick in every race, grouped by course with the races in time order. Shows the price you could take, the price the night before, the SP, the result and the euro profit.", "Your daily card. Green rows are the strongest edges.")
-    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, at 4/1 or shorter, in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model.", "Fewer bets, but aimed at winners rather than long shots.")
+    R("BEST_PER_RACE", "Yesterday's and today's pick in every race, grouped by course with the races in time order. Shows the price you could take, the price the night before, the SP, the result and the euro profit. Horses removed from a race appear as red struck-through rows.", "Your daily card. Green rows are the strongest edges.")
+    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, at 4/1 or shorter, in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model. A pending bet on a horse that has been removed from the race shows as a red struck-through row.", "Fewer bets, but aimed at winners rather than long shots.")
     R("RACE_BEST_SUMMARY", "The scoreboard for all the picks in RACE_BEST_TRACKER: wins, places, ROI, CLV and euro profit, for everything together and split into groups (price, field size and so on).", "Start here to see how the picks are doing and where they win or lose.")
     R("RACE_BEST_TRACKER", "The permanent log of every BEST_PER_RACE pick, one row per race, from the pick through to the result and the money won or lost.", "The raw record behind the summary. Check individual bets here.")
     R("GUIDE", "This tab: what every tab and every column means, in plain English.", "Keep it handy. Anything not explained here is not part of the sheet.")
@@ -1829,6 +1858,7 @@ def guide_rows():
     R("BET_TRACKER", "Same as RACE_BEST_TRACKER but for the BETS_TO_PLACE list.", "The record of your stricter real-betting picks.")
     R("TRACKER_SUMMARY", "Same as RACE_BEST_SUMMARY but for BET_TRACKER.", "The scoreboard for the BETS_TO_PLACE list.")
     R("FAV_BASELINE_TRACKER", "A log of 'just back the favourite in every race', staked the same way as your bets.", "The yardstick. If the picks can't beat simply backing favourites, the model isn't adding anything.")
+    R("FIELD_BASELINE", "The field of runners the program saw the first time it found each race. Used to spot horses added or removed later. Rows older than 3 days are deleted automatically.", "Don't edit it. If you clear it, the next run simply takes a fresh baseline.")
     R("RUNNERS_TARGET", "Every runner in every race still to come, with its price and all the model numbers.", "The full list behind the picks.")
     R("SIGNALS", "The same runners sorted with the biggest edge at the top, plus shorten_score.", "Quick way to see which horses the model likes most.")
     R("VALUE_BETS_TARGET", "Only runners whose edge is at least the minimum (2% by default), biggest first.", "Horses the model rates clearly above the market.")
@@ -1889,6 +1919,7 @@ def guide_rows():
     R("night_dec", "The night-before price in decimal form.", "Used to work out night CLV.")
     R("model_prob", "The model's chance that the horse wins, as a percentage. 30% is roughly 2/1.", "Compare with fair_prob. The gap is the edge.")
     R("value_edge", "model_prob minus fair_prob, in percentage points. 5% means the model rates the horse 5 points better than the market does.", "Bigger means the model disagrees with the market more. 5% or more turns the row green.")
+    R("field_change", "ADDED means this horse was not in the first field the program saw for the race. REMOVED means it was in the first field but has gone. Blank means no change.", "Yellow rows are added horses. Red struck-through rows are removed horses.")
     R("form_score", "A 0 to 1 score for the horse's last three runs, counting the latest most (50%, then 30%, then 20%). 1 means it won, 0.5 means mid-field, 0.1 means pulled up or fell.", "Higher is better recent form.")
     R("confidence", "The share of runners in the race that have at least 2 previous runs.", "Low confidence means many unraced or lightly raced horses, so the form is less reliable.")
     R("reason", "The two things pushing the model's rating of this horse up the most, for example 'form +0.23, c&d +0.07'.", "A quick 'why'. The numbers are the size of the push in the model's own units.")
@@ -1939,7 +1970,7 @@ def guide_rows():
     R("logged_at", "When the runner's information was recorded.", "")
     R("dec_market", "The market (median bookmaker) price in decimal form when logged.", "")
     R("dec_best", "The best bookmaker price in decimal form when logged.", "")
-    R("src", "Where the market price came from: b for bookmakers, p for Probable SP.", "Price moves are only compared like with like.")
+    R("src", "Where the market price came from: b for bookmakers, p for Probable SP, n for a night-time bookmaker price recorded for a horse with no other price.", "Price moves are only compared like with like.")
     R("runs_n", "How many previous runs were found for the horse.", "Horses with fewer than 2 are treated as lightly raced.")
     R("cd", "Course and distance record: 1 means it has won at this course and distance, 0.5 means it has won at the course or the distance, 0 means neither.", "")
     R("bf", "1 if the horse was beaten as favourite last time.", "The model learns whether that matters.")
@@ -2035,6 +2066,63 @@ def guide_requests(meta_sheets):
 
 
 # ----------------------------------------------------------------------------
+# Added / removed horses (compared with the first field seen for each race)
+# ----------------------------------------------------------------------------
+BASE_HEAD = ["race_key", "date", "course", "time", "horse", "norm", "first_seen"]
+ADDED_FMT = {"backgroundColor": {"red": 1.0, "green": 0.92, "blue": 0.6}, "textFormat": {"bold": True}}
+REMOVED_FMT = {"backgroundColor": {"red": 0.96, "green": 0.8, "blue": 0.8},
+               "textFormat": {"strikethrough": True,
+                              "foregroundColor": {"red": 0.6, "green": 0.0, "blue": 0.0}}}
+
+
+def load_baseline(sh, today):
+    """{race_key: {norm: horse}}: the field first seen for each race. Rows older than 3 days are dropped."""
+    cutoff = (today - dt.timedelta(days=3)).isoformat()
+    rows = read_tab_dicts(sh, "FIELD_BASELINE")
+    keep = [r for r in rows if r.get("race_key") and r.get("date", "") >= cutoff]
+    if len(keep) < len(rows):
+        write_tab(sh, "FIELD_BASELINE", BASE_HEAD, [[r.get(c, "") for c in BASE_HEAD] for r in keep])
+    base = {}
+    for r in keep:
+        base.setdefault(r["race_key"], {})[r["norm"]] = r["horse"]
+    return base
+
+
+def field_changes(fields, base, now):
+    """Returns (added {race_key: {norm}}, removed {race_key: [(name, norm)]}, new baseline rows).
+    A race with no baseline yet gets one. If more than half a field changes at once it is treated
+    as a scrape glitch and nothing is flagged."""
+    added, removed, new_rows = {}, {}, []
+    iso = now.isoformat(timespec="seconds")
+    for rk, f in fields.items():
+        cur = {n: name for name, n in f["horses"]}
+        if len(cur) < 2:
+            continue
+        orig = base.get(rk)
+        if not orig:
+            for n, name in cur.items():
+                new_rows.append([rk, f["date"], f["course"], f["time"], name, n, iso])
+            continue
+        gone = [n for n in orig if n not in cur]
+        add = {n for n in cur if n not in orig}
+        if len(gone) * 2 > len(orig) or len(add) * 2 > len(orig):
+            continue
+        if add:
+            added[rk] = add
+        if gone:
+            removed[rk] = [(orig[n], n) for n in gone]
+    return added, removed, new_rows
+
+
+def removed_runner(date, course, time_, name):
+    """A display-only row for a horse that has left the field."""
+    return {"date": date, "course": course, "region": region_of(course), "time": time_, "horse": name,
+            "odds": "", "dec": "", "fair_prob": "", "model_prob": "", "value_edge": "", "ev": "",
+            "mover_2h_pct": "", "mover_night_pct": "", "shorten_score": "",
+            "reason": "removed from the field since the first run", "field_change": "REMOVED"}
+
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
 def main():
@@ -2074,11 +2162,24 @@ def main():
 
     # 3. snapshots + movers
     snaps, snap_rows = load_snapshots(sh, day)
+    added, removed, removed_rows = {}, {}, []
+    try:
+        base = load_baseline(sh, now.date())
+        added, removed, new_base = field_changes(FIELDS, base, now)
+        append_rows(sh, "FIELD_BASELINE", BASE_HEAD, new_base)
+        removed_rows = [removed_runner(FIELDS[rk]["date"], FIELDS[rk]["course"], FIELDS[rk]["time"], name)
+                        for rk, items in removed.items() for name, _ in items]
+    except Exception as ex:                     # never let this break the main job
+        warnings.append(f"field change step failed: {ex}")
+    for r in runners:
+        rk = f"{r['date']}|{norm(r['course'])}|{r['time']}"
+        r["field_change"] = "ADDED" if r["norm"] in added.get(rk, ()) else ""
     add_movers(runners, snaps, now)
     stamp = now.isoformat(timespec="seconds")
     append_rows(sh, "MARKET_SNAPSHOTS_LOG", SNAP_HEAD,
                 [[stamp, r["date"], r["course"], r["time"], r["horse"], r["dec"], r.get("src", "p"),
-                  r.get("dec_best") or r.get("book_best_any"), r.get("dec_mv")] for r in runners])
+                  r.get("dec_best") or r.get("book_best_any"), r.get("dec_mv")] for r in runners]
+                + [[stamp] + x for x in BOOK_ONLY])
 
     # 4. model + bets
     add_model(runners)
@@ -2111,6 +2212,14 @@ def main():
     save_tracker(sh, fav_best, "FAV_BASELINE_TRACKER")
 
     # 5. write tabs
+    removed_norms = {(rk, n) for rk, items in removed.items() for _, n in items}
+    removed_bets = [removed_runner(t["date"], t["course"], t["time"], t["horse"]) for t in tracker
+                    if t["status"] == "PENDING"
+                    and (f"{t['date']}|{norm(t['course'])}|{t['time']}", norm(t["horse"])) in removed_norms]
+    removed_cards = [{**{c: "" for c in TRACKER_COLS}, "date": r["date"], "course": r["course"],
+                      "time": r["time"], "region": r["region"], "horse": r["horse"],
+                      "status": "REMOVED", "reason": r["reason"], "field_change": "REMOVED"}
+                     for r in removed_rows]
     r_head = R_HEAD
 
     def rr(r):
@@ -2121,16 +2230,19 @@ def main():
                 r.get("confidence"), r.get("flag"), r.get("reason"),
                 frac_text(r.get("dec_best")), r.get("books"), r.get("mover_1h_pct"),
                 r.get("wwr_gap"), r.get("course_wins"), r.get("course_runs"),
-                frac_text(r.get("night_best")), r.get("best_book")]
+                frac_text(r.get("night_best")), r.get("best_book"), r.get("field_change", "")]
 
     if runners:
-        write_tab(sh, "RUNNERS_TARGET", r_head, [rr(r) for r in runners])
+        def _k(r):
+            return (r["time"], r["course"], r["dec"] if isinstance(r["dec"], (int, float)) else 1e9)
+        write_tab(sh, "RUNNERS_TARGET", r_head, [rr(r) for r in sorted(runners + removed_rows, key=_k)])
         write_tab(sh, "SIGNALS", r_head + ["shorten_score"],
-                  [rr(r) + [r["shorten_score"]] for r in sorted(runners, key=lambda x: -x["value_edge"])])
+                  [rr(r) + [r["shorten_score"]] for r in sorted(runners, key=lambda x: -x["value_edge"])]
+                  + [rr(r) + [""] for r in removed_rows])
         write_tab(sh, "VALUE_BETS_TARGET", r_head,
                   [rr(r) for r in sorted(runners, key=lambda x: -x["value_edge"])
                    if r["value_edge"] >= MIN_EDGE])
-        write_tab(sh, "BETS_TO_PLACE", r_head, [rr(r) for r in bets])
+        write_tab(sh, "BETS_TO_PLACE", r_head, [rr(r) for r in bets] + [rr(r) for r in removed_bets])
     write_tab(sh, "RACES_TARGET", ["date", "course", "region", "time", "url", "runners", "priced"],
               [[x["date"], x["course"], x["region"], x["time"], x["url"], x["runners"], x["priced"]]
                for x in races])
@@ -2161,7 +2273,7 @@ def main():
     write_tab(sh, "TRACKER_SUMMARY", head, srows)
 
     recent = (day - dt.timedelta(days=1)).isoformat()
-    card = sorted((r for r in race_best if r["date"] >= recent), key=card_order)
+    card = sorted([r for r in race_best if r["date"] >= recent] + removed_cards, key=card_order)
     write_tab(sh, "BEST_PER_RACE", BEST_HEAD,
               [[r["date"], r["time"], r["course"], r["region"], r["horse"], r["odds_at_pick"],
                 frac_text(to_float(r.get("night_dec"))), r["model_prob"], r["value_edge"],
@@ -2169,7 +2281,7 @@ def main():
                 r["position"], r["field_size"], r["places_paid"], r["sp"], r["clv_pct"],
                 r["night_clv_pct"], r["won"], r["placed"], r["pnl_win_units"],
                 r["pnl_place_units"], r["bet_type"], r["stake_eur"], r["pnl_eur"], r["pnl_eur_sp"],
-                r["pick_rule"] or "edge"]
+                r["pick_rule"] or "edge", r.get("field_change", "")]
                for r in card])
     rhead, rrows = summarise(race_best, fav_best)
     write_tab(sh, "RACE_BEST_SUMMARY", rhead, rrows)
@@ -2214,6 +2326,9 @@ def main():
             ["race_best_settled", sum(1 for r in race_best if r["status"] == "SETTLED")],
             ["race_best_non_runners", sum(1 for r in race_best if r["status"] == "NON-RUNNER")],
             ["place_results_rechecked", rechecked],
+            ["night_book_rows_logged", len(BOOK_ONLY)],
+            ["fields_added", sum(len(v) for v in added.values())],
+            ["fields_removed", sum(len(v) for v in removed.values())],
             ["races_on_probable_sp", sum(1 for x in races if x.get("price_src") == "probable SP")],
             ["bets_staking_pnl_eur", round(sum(to_float(r.get("pnl_eur"), 0) for r in tracker
                                                if r["status"] == "SETTLED"), 2)],
