@@ -953,8 +953,11 @@ def choose_bets(runners, blocked=()):
     best = {}
     for r in runners:
         if WIN_FOCUS:
+            # UPDATED 1/3: the price cap is now tested on the best price from YOUR bookmakers (dec_best),
+            # and a horse with no price from them is skipped, so you only bet at a price you can take.
             ok = (r.get("model_rank") == 1 and r["model_prob"] >= MIN_WIN_PROB
-                  and 1.5 <= r["dec"] <= MAX_WIN_DEC and r["value_edge"] >= 0
+                  and r.get("dec_best") and 1.5 <= r["dec_best"] <= MAX_WIN_DEC
+                  and r["value_edge"] >= 0
                   and (not r.get("declared") or r["declared"] <= MAX_FIELD)
                   and (r.get("form_score") is None or r["form_score"] >= 0.40)
                   and (r.get("days_off") is None or r["days_off"] <= 90))
@@ -1306,6 +1309,18 @@ def stats_row(name, g):
             round(sum(nclvs) / len(nclvs) / 100, 4) if nclvs else ""] + _staking_cols(g)
 
 
+# UPDATED 3/3 (part A): would a settled pick have passed today's BETS_TO_PLACE rules? Used by summarise().
+def passes_win_focus(r):
+    """Would this settled pick have passed the BETS_TO_PLACE rules? Uses the columns stored in the tracker."""
+    mp = to_float(r.get("model_prob"), 0)
+    dec = to_float(r.get("dec_at_pick"), 0)
+    decl = to_float(r.get("declared"), 0)
+    fs = to_float(r.get("form_score"))
+    return (mp >= MIN_WIN_PROB and 1.5 <= dec <= MAX_WIN_DEC
+            and (not decl or decl <= MAX_FIELD) and (fs is None or fs >= 0.40)
+            and not r.get("race_flag"))
+
+
 def summarise(rows, fav_rows=None):
     """Win/place/ROI/CLV by segment. With fav_rows, adds a 'favourite in the same races' baseline."""
     settled = [r for r in rows if r.get("status") == "SETTLED"]
@@ -1319,6 +1334,11 @@ def summarise(rows, fav_rows=None):
         fs = to_float(r.get("field_size"), 0)
         groups.setdefault("Field " + band(fs, [8, 13], FIELD_LABELS), []).append(r)
         groups.setdefault("Race " + ("flagged" if r.get("race_flag") else "OK"), []).append(r)
+        # UPDATED 3/3 (part B): two new groups, model probability bands and "would it pass BETS_TO_PLACE rules"
+        mp = to_float(r.get("model_prob"), 0)
+        groups.setdefault("Model prob " + band(mp, [0.15, 0.20, 0.25, 0.30, 0.40],
+                          ["<15%", "15-20%", "20-25%", "25-30%", "30-40%", "40%+"]), []).append(r)
+        groups.setdefault("BETS_TO_PLACE rules: " + ("pass" if passes_win_focus(r) else "fail"), []).append(r)
         groups.setdefault("Pick rule: " + str(r.get("pick_rule") or "edge"), []).append(r)
         clv = to_float(r.get("clv_pct"))
         if clv is not None:
@@ -1916,13 +1936,13 @@ def guide_rows():
 
     H("2. THE TABS YOU SEE")
     R("BEST_PER_RACE", "Yesterday's and today's pick in every race, grouped by course with the races in time order. Shows the price you could take, the price the night before, the SP, the result and the euro profit. Horses removed from a race appear as red struck-through rows.", "Your daily card. Green rows are the strongest edges.")
-    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, at 4/1 or shorter, in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model. A pending bet on a horse that has been removed from the race shows as a red struck-through row.", "Fewer bets, but aimed at winners rather than long shots.")
+    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, priced at 4/1 or shorter by your bookmakers, in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model. A horse with no price from your bookmakers is skipped. A pending bet on a horse that has been removed from the race shows as a red struck-through row.", "Fewer bets, but aimed at winners rather than long shots.")
     R("RACE_BEST_SUMMARY", "The scoreboard for all the picks in RACE_BEST_TRACKER: wins, places, ROI, CLV and euro profit, for everything together and split into groups (price, field size and so on).", "Start here to see how the picks are doing and where they win or lose.")
     R("RACE_BEST_TRACKER", "The permanent log of every BEST_PER_RACE pick, one row per race, from the pick through to the result and the money won or lost.", "The raw record behind the summary. Check individual bets here.")
     R("GUIDE", "This tab: what every tab and every column means, in plain English.", "Keep it handy. Anything not explained here is not part of the sheet.")
 
     H("3. THE TABS THAT ARE HIDDEN (View > Hidden sheets)")
-    R("BET_TRACKER", "Same as RACE_BEST_TRACKER but for the BETS_TO_PLACE list.", "The record of your stricter real-betting picks.")
+    R("BET_TRACKER", "Same as RACE_BEST_TRACKER but for the BETS_TO_PLACE list. If the model changes its mind about a race before the off, the earlier pending pick is marked SUPERSEDED and is not counted.", "The record of your stricter real-betting picks.")
     R("TRACKER_SUMMARY", "Same as RACE_BEST_SUMMARY but for BET_TRACKER.", "The scoreboard for the BETS_TO_PLACE list.")
     R("FAV_BASELINE_TRACKER", "A log of 'just back the favourite in every race', staked the same way as your bets.", "The yardstick. If the picks can't beat simply backing favourites, the model isn't adding anything.")
     R("FIELD_BASELINE", "The field of runners the program saw the first time it found each race. Used to spot horses added or removed later. Rows older than 3 days are deleted automatically.", "Don't edit it. If you clear it, the next run simply takes a fresh baseline.")
@@ -1964,13 +1984,15 @@ def guide_rows():
     R("ALL BETS", "Every finished bet together.", "The headline result.")
     R("BASELINE: favourite, same races", "What you would have got backing the favourite in the same races, staked the same way. Only races that have a settled favourite record are included.", "The yardstick the picks need to beat.")
     R("Edge <3%, 3-5%, 5%+", "Bets grouped by how much the model liked the horse above the market when the pick was made.", "If bigger edges do better, the model is working. If not, edge isn't telling us much.")
+    R("Model prob groups", "Bets grouped by the model's win chance when the pick was made: under 15%, 15-20%, 20-25%, 25-30%, 30-40% and 40%+.", "If the higher groups win more often, the model's percentages mean something. If not, the probability filter (MIN_WIN_PROB) isn't helping.")
+    R("BETS_TO_PLACE rules: pass / fail", "Splits the settled picks into those that would have passed today's BETS_TO_PLACE rules (win chance, price cap, field size, form, no flagged race) and those that would not.", "Shows whether the strict rules really pick better horses than the picks they leave out. Most useful on RACE_BEST_SUMMARY, which has far more bets.")
     R("Odds groups", "Bets grouped by the starting price: under 3/2, 3/2 to 4/1, 4/1 to 9/1, and 9/1 or more.", "Shows which price range is making or losing money. Note that CLV in these groups is skewed, because the groups are chosen using the SP.")
     R("Field groups", "Bets grouped by number of runners: under 8, 8 to 12, 13 or more.", "Big fields are harder to predict.")
     R("Race OK / Race flagged", "Races with no warning flag, versus races flagged as big-field handicaps or ones with many lightly-raced horses.", "Shows whether the warning flags are really warning of anything.")
     R("Region: gb / ire", "Britain versus Ireland.", "")
     R("Price shortened / drifted", "Bets where the SP was shorter than the price taken (shortened, CLV positive), versus longer (drifted, CLV negative).", "Horses that drift tend to do worse, which is the market telling us something.")
     R("Pick rule groups", "Bets grouped by the method that chose them: edge (older picks, biggest value), prob (most likely winner), win-focus (BETS_TO_PLACE shortlist), fav (favourite).", "Lets you compare picking methods fairly on the same sheet.")
-    R("Status counts", "The last line counts rows by status: PENDING (race not finished), SETTLED, NON-RUNNER and NO_RESULT.", "")
+    R("Status counts", "The last line counts rows by status: PENDING (race not finished), SETTLED, NON-RUNNER, NO_RESULT and SUPERSEDED (an earlier pick the model replaced before the off).", "")
 
     H("6. COLUMNS IN BEST_PER_RACE AND THE TRACKERS")
     R("key", "A unique ID for the bet (date, course, time and horse).", "Stops the same bet being logged twice.")
@@ -1991,7 +2013,7 @@ def guide_rows():
     R("confidence", "The share of runners in the race that have at least 2 previous runs.", "Low confidence means many unraced or lightly raced horses, so the form is less reliable.")
     R("reason", "The two things pushing the model's rating of this horse up the most, for example 'form +0.23, c&d +0.07'.", "A quick 'why'. The numbers are the size of the push in the model's own units.")
     R("race_flag", "A warning: BIG-FIELD HCAP (a handicap with 16 or more runners) or MANY UNRACED (fewer than 70% of runners have 2 or more runs). Blank means no warning.", "These races are harder to predict. BETS_TO_PLACE skips them.")
-    R("status", "On bets: PENDING means the race isn't finished, SETTLED means the result is in, NON-RUNNER means the horse wasn't in the race, NO_RESULT means no result could be found after 2 days. In RUN_LOG and DASHBOARD it describes the run itself (OK, OK WITH WARNINGS, NO RACES LEFT and so on).", "Only SETTLED bets count in the scoreboard.")
+    R("status", "On bets: PENDING means the race isn't finished, SETTLED means the result is in, NON-RUNNER means the horse wasn't in the race, NO_RESULT means no result could be found after 2 days, SUPERSEDED means the model changed its pick for that race before the off (BET_TRACKER only). In RUN_LOG and DASHBOARD it describes the run itself (OK, OK WITH WARNINGS, NO RACES LEFT and so on).", "Only SETTLED bets count in the scoreboard.")
     R("position", "Where the horse finished. DNF means it didn't finish (pulled up, fell and so on).", "")
     R("field_size", "How many horses actually ran.", "Decides how many places are paid.")
     R("places_paid", "How many places count for the place part of an each-way bet in that race.", "5 to 7 runners pay 2 places, so a third there does not place.")
@@ -2091,7 +2113,7 @@ def guide_rows():
     R("REGION", "all, gb or ire. Which countries to include.", "")
     R("BOOKMAKERS", "The bookmakers you bet with, separated by commas, for example PaddyPower,Boylesports (the default). Write all to use the best price from every bookmaker instead.", "Your price and the night-before price use only these.")
     R("WIN_FOCUS", "1 (the default) makes BETS_TO_PLACE back only the model's top-rated horse. 0 uses the older biggest-value-edge method.", "")
-    R("MAX_WIN_DEC", "The biggest decimal price allowed for BETS_TO_PLACE. 5.0 is 4/1.", "Lower means shorter prices and more winners.")
+    R("MAX_WIN_DEC", "The biggest decimal price allowed for BETS_TO_PLACE, tested on the best price from your bookmakers. 5.0 is 4/1.", "Lower means shorter prices and more winners.")
     R("MAX_FIELD", "The most runners allowed in a BETS_TO_PLACE race. 12 by default.", "")
     R("MIN_WIN_PROB", "The smallest model win chance allowed for BETS_TO_PLACE. 0.25 means 25%.", "")
     R("BEST_RULE", "prob (default) makes BEST_PER_RACE pick the likeliest winner. edge picks the biggest value instead.", "")
@@ -2262,16 +2284,37 @@ def main():
     except Exception as ex:
         new_log = []
         warnings.append(f"runner log step failed: {ex}")
-    known = {r["key"] for r in tracker}
+
+    # UPDATED 2/3: one live bet per race. If the model now picks a different horse for a race that is
+    # still to run, the earlier PENDING bet is marked SUPERSEDED (kept in the tab, not counted in the
+    # summaries) instead of staying in the tracker as a second bet that is guaranteed to lose.
+    rule_name = "win-focus" if WIN_FOCUS else "edge"
+    live_races = {f"{r['date']}|{norm(r['course'])}|{r['time']}" for r in runners}   # races still to run
+    wanted = {}                                    # race key -> key of the horse we want to back now
+    for b in bets:
+        rk = f"{b['date']}|{norm(b['course'])}|{b['time']}"
+        wanted[rk] = f"{rk}|{norm(b['horse'])}"
+    for t in tracker:                              # a pending bet is dropped if the model no longer picks it
+        if t.get("status") != "PENDING":
+            continue
+        rk = f"{t['date']}|{norm(t['course'])}|{t['time']}"
+        if rk in live_races and wanted.get(rk) != t["key"]:
+            t["status"] = "SUPERSEDED"
+    by_key = {r["key"]: r for r in tracker}
     new_bets = 0
     for b in bets:
         key = f"{b['date']}|{norm(b['course'])}|{b['time']}|{norm(b['horse'])}"
-        if key in known:
-            continue
-        tracker.append({**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
-                        "course": b["course"], "time": b["time"], "status": "PENDING",
-                        **pick_fields(b, "win-focus" if WIN_FOCUS else "edge")})
-        new_bets += 1
+        row = by_key.get(key)
+        if row is None:
+            tracker.append({**{c: "" for c in TRACKER_COLS}, "key": key, "date": b["date"],
+                            "course": b["course"], "time": b["time"], "status": "PENDING",
+                            **pick_fields(b, rule_name)})
+            new_bets += 1
+        elif row.get("status") == "SUPERSEDED":    # the model went back to this horse before the off
+            row.update(pick_fields(b, rule_name))
+            row["status"] = "PENDING"
+    # END UPDATED 2/3
+
     cur_by_key = {runner_key(r): r for r in runners}        # keep pending bets' night price up to date
     for t in tracker:
         cr = cur_by_key.get(t["key"]) if t.get("status") == "PENDING" else None
