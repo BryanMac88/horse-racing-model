@@ -79,6 +79,21 @@ WIN_FOCUS = (os.environ.get("WIN_FOCUS") or "1") != "0"
 MIN_WIN_PROB = float(os.environ.get("MIN_WIN_PROB") or 0.25)
 MAX_WIN_DEC = float(os.environ.get("MAX_WIN_DEC") or 5.0)
 MAX_FIELD = int(os.environ.get("MAX_FIELD") or 12)
+# 1 = BETS_TO_PLACE only backs horses that one of YOUR bookmakers is pricing; 0 (default) falls back to the
+# market (median) price when they are not on the odds page, so the tab is not left empty.
+REQUIRE_MY_BOOK = (os.environ.get("REQUIRE_MY_BOOK") or "0") == "1"
+FUNNEL = {}                        # stage label -> how many top-rated horses got that far (shown on DASHBOARD)
+FUNNEL_STAGES = ["1 top-rated horse in each race",
+                 "2 model win chance >= MIN_WIN_PROB",
+                 "3 has a price",
+                 "4 price between 1.5 and MAX_WIN_DEC",
+                 "5 model edge >= 0",
+                 "6 field size <= MAX_FIELD",
+                 "7 recent form ok (>= 0.40)",
+                 "8 not off more than 90 days",
+                 "9 MIN_EV ok",
+                 "10 not a flagged race, has 2+ runs",
+                 "11 segment not switched off"]
 BEST_RULE = (os.environ.get("BEST_RULE") or "prob").strip().lower()
 STAKE_WIN = 5.0                    # euro on a straight win bet
 STAKE_EW = 2.5                     # euro each way (win part and place part)
@@ -951,18 +966,36 @@ def choose_bets(runners, blocked=()):
     chance (>= MIN_WIN_PROB), a short enough price, no poor recent form and no long layoff. Otherwise the
     older rule: biggest value edge above MIN_EDGE inside the price window."""
     best = {}
+    FUNNEL.clear()
+    FUNNEL.update({label: 0 for label in FUNNEL_STAGES})
     for r in runners:
         if WIN_FOCUS:
-            # UPDATED 1/3: the price cap is now tested on the best price from YOUR bookmakers (dec_best),
-            # and a horse with no price from them is skipped, so you only bet at a price you can take.
-            ok = (r.get("model_rank") == 1 and r["model_prob"] >= MIN_WIN_PROB
-                  and r.get("dec_best") and 1.5 <= r["dec_best"] <= MAX_WIN_DEC
-                  and r["value_edge"] >= 0
-                  and (not r.get("declared") or r["declared"] <= MAX_FIELD)
-                  and (r.get("form_score") is None or r["form_score"] >= 0.40)
-                  and (r.get("days_off") is None or r["days_off"] <= 90))
-            if ok and MIN_EV_SET and r.get("dec_best") and r["ev"] < MIN_EV:
-                ok = False
+            # UPDATED 1/3 (revised): the price cap is tested on the best price from YOUR bookmakers when
+            # there is one. If none of your bookmakers has a price for the horse, the market (median)
+            # price is used instead, unless REQUIRE_MY_BOOK=1. Every stage is counted in FUNNEL so the
+            # DASHBOARD shows exactly where horses are being filtered out.
+            ok = False
+            if r.get("model_rank") == 1:
+                px = r.get("dec_best") or (None if REQUIRE_MY_BOOK else r["dec"])
+                tests = [
+                    (r["model_prob"] >= MIN_WIN_PROB),
+                    bool(px),
+                    bool(px) and 1.5 <= px <= MAX_WIN_DEC,
+                    r["value_edge"] >= 0,
+                    (not r.get("declared") or r["declared"] <= MAX_FIELD),
+                    (r.get("form_score") is None or r["form_score"] >= 0.40),
+                    (r.get("days_off") is None or r["days_off"] <= 90),
+                    not (MIN_EV_SET and r.get("dec_best") and r["ev"] < MIN_EV),
+                    not (STRICT and (r.get("flag") or (r.get("runs_n") or 0) < 2)),
+                    not (blocked and set(runner_segments(r)) & set(blocked)),
+                ]
+                FUNNEL[FUNNEL_STAGES[0]] += 1
+                ok = True
+                for label, passed in zip(FUNNEL_STAGES[1:], tests):
+                    if not passed:
+                        ok = False
+                        break
+                    FUNNEL[label] += 1
             rank_key = lambda x: x["model_prob"]
         else:
             ok = r["value_edge"] >= MIN_EDGE and MIN_DEC <= r["dec"] <= MAX_DEC
@@ -1936,7 +1969,7 @@ def guide_rows():
 
     H("2. THE TABS YOU SEE")
     R("BEST_PER_RACE", "Yesterday's and today's pick in every race, grouped by course with the races in time order. Shows the price you could take, the price the night before, the SP, the result and the euro profit. Horses removed from a race appear as red struck-through rows.", "Your daily card. Green rows are the strongest edges.")
-    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, priced at 4/1 or shorter by your bookmakers, in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model. A horse with no price from your bookmakers is skipped. A pending bet on a horse that has been removed from the race shows as a red struck-through row.", "Fewer bets, but aimed at winners rather than long shots.")
+    R("BETS_TO_PLACE", "The short list of the strongest picks for real betting. By default only the model's top-rated horse in a race, priced at 4/1 or shorter (using your bookmakers' best price, or the market price when they are not pricing the horse), in a field of 12 or fewer, with decent recent form, no long break and at least a 25% chance on the model. A pending bet on a horse that has been removed from the race shows as a red struck-through row.", "Fewer bets, but aimed at winners rather than long shots.")
     R("RACE_BEST_SUMMARY", "The scoreboard for all the picks in RACE_BEST_TRACKER: wins, places, ROI, CLV and euro profit, for everything together and split into groups (price, field size and so on).", "Start here to see how the picks are doing and where they win or lose.")
     R("RACE_BEST_TRACKER", "The permanent log of every BEST_PER_RACE pick, one row per race, from the pick through to the result and the money won or lost.", "The raw record behind the summary. Check individual bets here.")
     R("GUIDE", "This tab: what every tab and every column means, in plain English.", "Keep it handy. Anything not explained here is not part of the sheet.")
@@ -2113,8 +2146,9 @@ def guide_rows():
     R("REGION", "all, gb or ire. Which countries to include.", "")
     R("BOOKMAKERS", "The bookmakers you bet with, separated by commas, for example PaddyPower,Boylesports (the default). Write all to use the best price from every bookmaker instead.", "Your price and the night-before price use only these.")
     R("WIN_FOCUS", "1 (the default) makes BETS_TO_PLACE back only the model's top-rated horse. 0 uses the older biggest-value-edge method.", "")
-    R("MAX_WIN_DEC", "The biggest decimal price allowed for BETS_TO_PLACE, tested on the best price from your bookmakers. 5.0 is 4/1.", "Lower means shorter prices and more winners.")
+    R("MAX_WIN_DEC", "The biggest decimal price allowed for BETS_TO_PLACE, tested on the best price from your bookmakers (or the market price if they are not pricing the horse). 5.0 is 4/1.", "Lower means shorter prices and more winners.")
     R("MAX_FIELD", "The most runners allowed in a BETS_TO_PLACE race. 12 by default.", "")
+    R("REQUIRE_MY_BOOK", "1 means BETS_TO_PLACE only backs horses that one of your bookmakers is pricing. 0 (the default) falls back to the market price when they are not on the odds page.", "Use 1 once DASHBOARD shows runners_with_my_bookmaker_price_pct is high, so every bet is at a price you could really take.")
     R("MIN_WIN_PROB", "The smallest model win chance allowed for BETS_TO_PLACE. 0.25 means 25%.", "")
     R("BEST_RULE", "prob (default) makes BEST_PER_RACE pick the likeliest winner. edge picks the biggest value instead.", "")
     R("MIN_VALUE_EDGE", "The smallest edge for the older value method and for VALUE_BETS_TARGET. 0.02 means 2%.", "")
@@ -2471,6 +2505,12 @@ def main():
             ["blocked_segments", "; ".join(f"{k} (n={v[0]}, ROI {v[1]}%, CLV {v[2]}%)"
                                            for k, v in blocked.items()) or "none"],
             ["baseline_settled", sum(1 for r in fav_best if r["status"] == "SETTLED")], []]
+    dash.append(["bets_funnel (top-rated horses that got this far)", f"{'FILTERS: MIN_WIN_PROB=' + str(MIN_WIN_PROB) + ', MAX_WIN_DEC=' + str(MAX_WIN_DEC) + ', MAX_FIELD=' + str(MAX_FIELD) + ', MIN_EV=' + (str(MIN_EV) if MIN_EV_SET else 'off') + ', REQUIRE_MY_BOOK=' + ('1' if REQUIRE_MY_BOOK else '0')}"])
+    for label, n in FUNNEL.items():
+        dash.append(["  funnel " + label, n])
+    dash.append(["runners_with_my_bookmaker_price_pct", round(100 * sum(1 for r in runners if r.get("dec_best"))
+                                                              / len(runners)) if runners else 0])
+    dash.append([])
     for x in [x for x in races if x.get("price_src") == "probable SP"][:10]:
         dash.append(["probable_sp_race", f"{x['course']} {x['time']}: bookmaker prices cover {x.get('books_cover', '?')} runners"])
     for course, (nr, nrun) in sorted(per_meeting.items()):
